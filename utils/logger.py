@@ -60,28 +60,32 @@ def setup_logger(log_level: str = 'INFO',
     console_handler.setFormatter(console_formatter)
     logger.addHandler(console_handler)
     
-    # Create file handler if log file is specified
-    if log_file:
-        # Create log directory if it doesn't exist
-        log_dir = os.path.dirname(log_file)
-        if log_dir and not os.path.exists(log_dir):
-            os.makedirs(log_dir, exist_ok=True)
-        
-        # Create formatter for file (without colors)
-        file_formatter = logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S"
-        )
-        
-        # Create file handler with rotation
-        file_handler = logging.handlers.RotatingFileHandler(
-            log_file,
-            maxBytes=max_file_size,
-            backupCount=backup_count,
-            encoding='utf-8'
-        )
-        file_handler.setFormatter(file_formatter)
-        logger.addHandler(file_handler)
+    # If no log file specified, use default in debug_logs directory
+    if not log_file:
+        # Ensure debug_logs directory exists
+        os.makedirs('debug_logs', exist_ok=True)
+        log_file = os.path.join('debug_logs', 'whatsapp_bot.log')
+    
+    # Create log directory if it doesn't exist
+    log_dir = os.path.dirname(log_file)
+    if log_dir and not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
+    
+    # Create formatter for file (without colors)
+    file_formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    
+    # Create file handler with rotation
+    file_handler = logging.handlers.RotatingFileHandler(
+        log_file,
+        maxBytes=max_file_size,
+        backupCount=backup_count,
+        encoding='utf-8'
+    )
+    file_handler.setFormatter(file_formatter)
+    logger.addHandler(file_handler)
     
     # Log initial message
     logger.debug(f"Logger initialized with level {log_level}")

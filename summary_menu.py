@@ -268,7 +268,10 @@ def generate_summary(components, group_id, days=1, debug=False):
             # Save raw messages to file for analysis
             try:
                 import json
-                debug_filename = f"debug_messages_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                import os
+                # Create debug_logs directory if it doesn't exist
+                os.makedirs('debug_logs', exist_ok=True)
+                debug_filename = f"debug_logs/debug_messages_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
                 with open(debug_filename, 'w', encoding='utf-8') as f:
                     json.dump(messages[:5], f, indent=2, ensure_ascii=False)
                 print(f"✅ Sample messages saved to {debug_filename}")
@@ -607,7 +610,10 @@ def show_main_menu():
                         
                         # Save raw messages to file for analysis
                         import json
-                        debug_filename = f"debug_msgs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                        import os
+                        # Create debug_logs directory if it doesn't exist
+                        os.makedirs('debug_logs', exist_ok=True)
+                        debug_filename = f"debug_logs/debug_msgs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
                         with open(debug_filename, 'w', encoding='utf-8') as f:
                             # Save just a sample to avoid too large files
                             json.dump(messages[:10], f, indent=2, ensure_ascii=False)
