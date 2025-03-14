@@ -29,9 +29,9 @@ ENV/
 .env/
 .venv/
 
-# Debug and log files
-debug_logs/
-*.log
+# Debug files
+debug_*.json
+debug_*.log
 
 # User settings
 user_settings.json
@@ -40,16 +40,4 @@ user_settings.json
 .idea/
 .vscode/
 *.swp
-*.swo
-
-# Database files
-*.db
-*.sqlite3
-
-# Temp files
-.DS_Store
-Thumbs.db
-
-# Credentials
-*.pem
-*.key 
+*.swo 
