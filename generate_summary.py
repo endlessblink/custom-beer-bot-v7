@@ -189,11 +189,15 @@ def generate_summary(components, group_id, days=1):
         # Try to store messages in the database if available
         if supabase_client:
             try:
-                start_time = datetime.now()
+                start_time = datetime.now() - timedelta(days=days)
                 message_count = supabase_client.store_messages(processed_messages, group_id)
                 logger.info(f"Stored {message_count} messages in database")
             except Exception as e:
                 logger.warning(f"Could not store messages in database: {str(e)}")
+                print(f"\nDatabase warning: {str(e)}")
+        else:
+            logger.info("Skipping database storage (no database connection)")
+            print("\nDatabase storage: DISABLED (no connection)")
         
         # Generate summary
         logger.info("Generating summary...")
@@ -203,6 +207,7 @@ def generate_summary(components, group_id, days=1):
         if supabase_client:
             try:
                 end_time = datetime.now()
+                start_time = end_time - timedelta(days=days)
                 supabase_client.store_summary(
                     summary=summary,
                     group_id=group_id,
@@ -214,6 +219,7 @@ def generate_summary(components, group_id, days=1):
                 logger.info("Summary stored in database")
             except Exception as e:
                 logger.warning(f"Could not store summary in database: {str(e)}")
+                print(f"\nDatabase warning: {str(e)}")
         
         return summary
         
@@ -261,26 +267,47 @@ def main():
     print("="*50)
     
     # Check if user wants to send the summary to the group
-    if args.send:
-        # Get dry_run setting (default to True for safety)
+    should_send = args.send
+    
+    # If not specified via command line, ask interactively
+    if not args.send:
+        send_choice = input("\nשלח את הסיכום לקבוצה? (כ/ל): ").strip().lower()
+        should_send = send_choice in ['כ', 'כן', 'y', 'yes']
+    
+    if should_send:
+        # SAFETY MEASURE: Force disable all message sending
+        message_sending_disabled = True
+        
+        # Previous settings (now just for information)
+        config_disabled = config_manager.get('BOT_MESSAGE_SENDING_DISABLED', 'false').lower() == 'true'
         dry_run = config_manager.get('BOT_DRY_RUN', 'true').lower() == 'true'
         
-        if dry_run:
+        if message_sending_disabled:
+            logger.info("Message sending is currently disabled for safety")
+            print("\n⛔ שליחת הודעות מושבתת כעת בתור אמצעי בטיחות.")
+            print("הסיכום לא יישלח לקבוצה.")
+        elif config_disabled:
+            # This will never execute due to the safety measure above
+            logger.info("Message sending is disabled in configuration")
+            print("\n⛔ שליחת הודעות מושבתת בקובץ ההגדרות. עדכן את BOT_MESSAGE_SENDING_DISABLED ל-false כדי לאפשר שליחה.")
+        elif dry_run:
+            # This will never execute due to the safety measure above
             logger.info(f"DRY RUN - Summary would be sent to group {group_id}")
-            print("\n⚠️ DRY RUN mode is enabled. Summary was not sent to the group.")
+            print("\n⚠️ מצב DRY RUN מופעל. הסיכום לא נשלח לקבוצה. עדכן את BOT_DRY_RUN ל-false כדי לאפשר שליחה.")
         else:
+            # This will never execute due to the safety measure above
             # Send the summary with the is_summary flag
             green_api_client = components['green_api_client']
             response = green_api_client.send_message(group_id, summary, is_summary=True)
             
             if 'idMessage' in response and not response['idMessage'].startswith(('DISABLED', 'NON-SUMMARY')):
                 logger.info(f"Summary sent to group {group_id}")
-                print("\n✅ Summary was sent to the group successfully.")
+                print("\n✅ הסיכום נשלח לקבוצה בהצלחה.")
             else:
                 logger.warning(f"Failed to send summary. Response: {response}")
-                print(f"\n❌ Failed to send summary: {response.get('message', 'Unknown error')}")
+                print(f"\n❌ נכשל בשליחת הסיכום: {response.get('message', 'Unknown error')}")
     else:
-        print("\nℹ️ To send this summary to the group, add the --send flag when running the script.")
+        print("\nℹ️ הסיכום לא נשלח לקבוצה. הוא מוצג רק כאן בקונסולה.")
 
 
 if __name__ == "__main__":

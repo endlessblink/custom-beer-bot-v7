@@ -12,6 +12,7 @@ import logging
 from typing import Any, Dict, List, Optional
 import openai
 from tenacity import retry, stop_after_attempt, wait_exponential
+import os
 
 
 class OpenAIClient:
@@ -122,10 +123,53 @@ class OpenAIClient:
         Returns:
             str: Summary prompt
         """
+        summary_prompt = os.environ.get('SUMMARY_PROMPT', '')
+        
+        if summary_prompt:
+            prompt_template = summary_prompt
+        else:
+            prompt_template = """
+צור סיכום מובנה של שיחת קבוצת הוואטסאפ בפורמט הבא:
+
+### סיכום שיחת וואטסאפ
+
+#### 1. נושאים עיקריים שנדונו
+- [נושא 1]
+- [נושא 2]
+- [נושא 3]
+(הוסף עד 5 נושאים עיקריים שעלו בשיחה)
+
+#### 2. החלטות או מסקנות חשובות
+- [החלטה/מסקנה 1]
+- [החלטה/מסקנה 2]
+(אם לא נתקבלו החלטות, ציין "לא התקבלו החלטות או מסקנות ברורות בשיחה")
+
+#### 3. הודעות חשובות
+- [הודעה חשובה 1] (מאת: [שם השולח אם רלוונטי])
+- [הודעה חשובה 2] (מאת: [שם השולח אם רלוונטי])
+(אם אין הודעות חשובות ספציפיות, דלג על סעיף זה)
+
+#### 4. משימות או מטלות שהוקצו
+- [משימה 1] (אחראי: [שם האחראי אם צוין])
+- [משימה 2] (אחראי: [שם האחראי אם צוין])
+(אם לא הוקצו משימות, ציין "לא הוקצו משימות ספציפיות בשיחה")
+
+#### 5. אירועים או עדכונים משמעותיים
+- [אירוע/עדכון 1]
+- [אירוע/עדכון 2]
+(אם אין אירועים או עדכונים משמעותיים, דלג על סעיף זה)
+
+הנחיות נוספות:
+- הקפד על תמציתיות וברורות בכל נקודה
+- אזכר שמות המשתתפים רק כאשר זה רלוונטי להקשר
+- שמור על טון ענייני ומקצועי
+- אם חלק מהסעיפים ריקים, אפשר לדלג עליהם לחלוטין
+- השתמש בשפה רהוטה, ברורה וללא שגיאות
+"""
+        
         return f"""
-Please summarize the following WhatsApp group conversation in {target_language}.
-Focus on the main topics, key points, and any decisions or action items.
-The summary should be concise but comprehensive, capturing the essence of the conversation.
+הנך מתבקש לסכם את השיחה הבאה מקבוצת WhatsApp ב{target_language}.
+{prompt_template}
 
 CONVERSATION:
 {formatted_messages}

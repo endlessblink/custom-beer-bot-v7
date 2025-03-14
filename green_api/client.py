@@ -137,6 +137,19 @@ class GreenAPIClient:
         Returns:
             Dict[str, Any]: Response from the API or dummy response if not a summary
         """
+        # GLOBAL SAFETY MEASURE: Force disable all message sending
+        # This is a hard-coded safety measure that overrides all other settings
+        force_disable_messages = True
+        
+        if force_disable_messages:
+            self.logger.warning("🛑 SAFETY MEASURE ACTIVE: All message sending is disabled by a hard-coded safety measure.")
+            self.logger.info(f"Would have sent message to {chat_id}: {message[:50]}...")
+            return {
+                "idMessage": "SAFETY-DISABLED-XXXX",
+                "status": "disabled",
+                "message": "Message sending has been disabled by a safety measure"
+            }
+        
         # Check if message sending is explicitly disabled
         message_sending_disabled = os.environ.get('BOT_MESSAGE_SENDING_DISABLED', 'false').lower() == 'true'
         

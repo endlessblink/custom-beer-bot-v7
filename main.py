@@ -25,7 +25,7 @@ import signal
 import argparse
 import logging
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from config.config_manager import ConfigManager
 from green_api.client import GreenAPIClient
@@ -122,11 +122,21 @@ def initialize_components(config):
         max_retries=int(config.get('BOT_MAX_RETRIES', 3))
     )
     
-    # Initialize Supabase client
-    supabase_client = SupabaseClient(
-        url=config.get('SUPABASE_URL'),
-        key=config.get('SUPABASE_KEY')
-    )
+    # Initialize Supabase client (optional)
+    supabase_client = None
+    try:
+        if config.get('SUPABASE_URL') and config.get('SUPABASE_KEY'):
+            logger.info("Initializing Supabase client...")
+            supabase_client = SupabaseClient(
+                url=config.get('SUPABASE_URL'),
+                key=config.get('SUPABASE_KEY')
+            )
+            logger.info("Supabase client initialized successfully")
+        else:
+            logger.info("Supabase configuration not found. Database features will be disabled.")
+    except Exception as e:
+        logger.warning(f"Failed to initialize Supabase client: {str(e)}")
+        logger.info("Continuing without database functionality")
     
     return {
         'green_api_client': green_api_client,
@@ -243,7 +253,14 @@ def schedule_summary_tasks(components, group_id, config_manager):
             logger.info("Summary stored in database")
             
             # Send only summary messages with the is_summary flag
-            if not dry_run:
+            # SAFETY MEASURE: Force disable all message sending
+            message_sending_disabled = True
+            
+            if message_sending_disabled:
+                logger.info("⛔ Message sending is currently disabled for safety.")
+                logger.info("Summary not sent to group.")
+            elif not dry_run:
+                # This code will never execute due to the safety measure above
                 green_api_client.send_message(group_id, summary, is_summary=True)
                 logger.info(f"Summary sent to group {group_id}")
             else:
@@ -259,6 +276,68 @@ def schedule_summary_tasks(components, group_id, config_manager):
     scheduler.schedule_summary(summary_task, int(summary_interval))
     
     logger.info(f"Summary task scheduled to run every {summary_interval} hours")
+
+
+def generate_summary(components, group_id, messages=None):
+    """Generate and send a summary of recent messages"""
+    green_api_client = components['green_api_client']
+    message_processor = components['message_processor']
+    openai_client = components['openai_client']
+    supabase_client = components['supabase_client']
+    
+    try:
+        # If messages are not provided, fetch them from the chat history
+        if messages is None:
+            logger.info(f"Fetching messages for group {group_id}")
+            messages = green_api_client.get_chat_history(group_id)
+        
+        if not messages:
+            logger.info("No messages to summarize")
+            return None
+        
+        logger.info(f"Processing {len(messages)} messages")
+        processed_messages = message_processor.process_messages(messages)
+        
+        if not processed_messages:
+            logger.info("No valid messages to summarize after processing")
+            return None
+        
+        # Store messages in the database
+        if supabase_client is not None:
+            try:
+                message_count = supabase_client.store_messages(processed_messages, group_id)
+                logger.info(f"Stored {message_count} messages in database")
+            except Exception as e:
+                logger.warning(f"Could not store messages in database: {str(e)}")
+        else:
+            logger.info("Skipping database storage for messages (no database connection)")
+        
+        # Generate summary
+        logger.info("Generating summary...")
+        summary = openai_client.generate_summary(processed_messages)
+        
+        # Store summary in the database
+        if supabase_client is not None:
+            try:
+                supabase_client.store_summary(
+                    summary=summary,
+                    group_id=group_id,
+                    start_time=datetime.now() - timedelta(days=1),
+                    end_time=datetime.now(),
+                    message_count=len(processed_messages),
+                    model_used=openai_client.model
+                )
+                logger.info("Summary stored in database")
+            except Exception as e:
+                logger.warning(f"Could not store summary in database: {str(e)}")
+        else:
+            logger.info("Skipping database storage for summary (no database connection)")
+        
+        return summary
+        
+    except Exception as e:
+        logger.error(f"Error generating summary: {str(e)}")
+        return None
 
 
 def main():

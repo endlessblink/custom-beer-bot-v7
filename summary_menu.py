@@ -50,7 +50,7 @@ def initialize_components():
     # Load user settings (overrides env vars)
     load_user_settings()
     
-    # Initialize config manager
+    # Create config manager
     config_manager = ConfigManager()
     
     # Initialize Green API client
@@ -76,22 +76,28 @@ def initialize_components():
     )
     
     # Initialize Supabase client (optional)
+    supabase_client = None
     try:
-        supabase_client = SupabaseClient(
-            url=config_manager.get('SUPABASE_URL'),
-            key=config_manager.get('SUPABASE_KEY')
-        )
+        if config_manager.get('SUPABASE_URL') and config_manager.get('SUPABASE_KEY'):
+            logger.info("Initializing Supabase client...")
+            supabase_client = SupabaseClient(
+                url=config_manager.get('SUPABASE_URL'),
+                key=config_manager.get('SUPABASE_KEY')
+            )
+            logger.info("Supabase client initialized successfully")
+        else:
+            logger.info("Supabase configuration not found. Database features will be disabled.")
     except Exception as e:
-        logger.warning(f"Could not initialize Supabase client: {str(e)}")
-        supabase_client = None
+        logger.warning(f"Failed to initialize Supabase client: {str(e)}")
+        logger.info("Continuing without database functionality")
     
     return {
-        'config_manager': config_manager,
         'green_api_client': green_api_client,
         'group_manager': group_manager,
         'openai_client': openai_client,
         'message_processor': message_processor,
-        'supabase_client': supabase_client
+        'supabase_client': supabase_client,
+        'config_manager': config_manager
     }
 
 def select_group(components):
@@ -233,126 +239,100 @@ def generate_summary(components, group_id, days=1, debug=False):
     openai_client = components['openai_client']
     supabase_client = components['supabase_client']
     
-    print(f"\n⏳ Fetching messages for group {group_id}...")
-    
     try:
         # Fetch recent messages
+        if debug:
+            print("\n⏳ Fetching messages...")
         messages = green_api_client.get_chat_history(group_id)
         
         if not messages:
-            print("❌ No messages found to summarize.")
+            if debug:
+                print("❌ No messages found")
             return "אין הודעות לסיכום."
         
-        print(f"✅ Found {len(messages)} messages")
-        
-        # Debug: Print example message structure
-        if debug and messages:
-            print("\n==== DEBUG: SAMPLE MESSAGE STRUCTURE ====")
-            example_message = messages[0]
-            print(f"Message keys: {list(example_message.keys())}")
+        if debug:
+            print(f"✅ Found {len(messages)} messages")
             
-            if 'messageData' in example_message:
-                print(f"messageData keys: {list(example_message['messageData'].keys())}")
-                
-                # Check for the specific structure of the message
-                message_data = example_message['messageData']
-                for key in message_data:
-                    if isinstance(message_data[key], dict):
-                        print(f"  - {key} keys: {list(message_data[key].keys())}")
-            
-            print("Sample message info:")
-            print(f"  - Sender: {example_message.get('senderName', 'Unknown')}")
-            print(f"  - Type: {example_message.get('type', 'Unknown')}")
-            print(f"  - Timestamp: {example_message.get('timestamp', 'Unknown')}")
-            
-            # Save raw messages to file for analysis
-            try:
-                import json
-                import os
-                # Create debug_logs directory if it doesn't exist
-                os.makedirs('debug_logs', exist_ok=True)
-                debug_filename = f"debug_logs/debug_messages_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-                with open(debug_filename, 'w', encoding='utf-8') as f:
-                    json.dump(messages[:5], f, indent=2, ensure_ascii=False)
-                print(f"✅ Sample messages saved to {debug_filename}")
-            except Exception as e:
-                print(f"❌ Error saving debug file: {str(e)}")
-                
-            print("==== END DEBUG INFO ====\n")
+            # Print a sample message
+            if messages:
+                print("\nSample message:")
+                sample = json.dumps(messages[0], indent=2, ensure_ascii=False)
+                # Truncate sample if too long
+                if len(sample) > 500:
+                    sample = sample[:500] + "..."
+                print(sample)
         
         # Process messages
-        print("⏳ Processing messages...")
-        
-        # Set debug mode in message processor
         if debug:
-            message_processor.set_debug_mode(True)
-            
+            print("\n⏳ Processing messages...")
         processed_messages = message_processor.process_messages(messages)
         
         if not processed_messages:
-            print("❌ No valid messages to summarize after processing")
-            
             if debug:
-                print("\n==== DEBUG: MESSAGE PROCESSING ====")
-                # Sample a few messages to understand why they were rejected
-                print(f"Analyzing why messages were rejected:")
-                sample_size = min(5, len(messages))
-                for i, msg in enumerate(messages[:sample_size]):
-                    print(f"\nSample message {i+1}:")
-                    # Try to process and see what happens
-                    result = message_processor._process_message(msg)
-                    if result:
-                        print(f"  ✓ Message would be ACCEPTED")
-                    else:
-                        msg_type = message_processor._get_message_type(msg)
-                        text = message_processor._extract_text(msg, msg_type) if msg_type else "N/A"
-                        print(f"  ✗ Message would be REJECTED")
-                        print(f"    - Type detected: {msg_type}")
-                        print(f"    - Text extracted: {text[:50]}...")
-                        print(f"    - Sender: {msg.get('senderName', 'Unknown')}")
-                
-                print("\nTips for fixing:")
-                print("1. Check message type detection in message_processor.py")
-                print("2. Verify text extraction logic for these message types")
-                print("3. Check if any message is being filtered out incorrectly")
-                print("==== END DEBUG INFO ====\n")
-                
-            return "אין הודעות תקפות לסיכום."
+                print("❌ No valid messages after processing")
+            return "אין הודעות תקפות לסיכום אחרי עיבוד."
         
-        print(f"✅ Processed {len(processed_messages)} valid messages")
+        if debug:
+            print(f"✅ Processed {len(processed_messages)} valid messages")
+            
+            # Print a sample processed message
+            if processed_messages:
+                print("\nSample processed message:")
+                sample = json.dumps(processed_messages[0], indent=2, ensure_ascii=False)
+                # Truncate sample if too long
+                if len(sample) > 500:
+                    sample = sample[:500] + "..."
+                print(sample)
         
-        # Debug: Show sample of processed messages
-        if debug and processed_messages:
-            print("\n==== DEBUG: SAMPLE PROCESSED MESSAGES ====")
-            sample_size = min(3, len(processed_messages))
-            for i, msg in enumerate(processed_messages[:sample_size]):
-                print(f"Processed message {i+1}:")
-                print(f"  - Sender: {msg.get('senderName', 'Unknown')}")
-                print(f"  - Text: {msg.get('textMessage', '')[:100]}...")
-                print(f"  - Type: {msg.get('type', 'Unknown')}")
-                print(f"  - Time: {msg.get('timestamp', 'Unknown')}")
-                print("")
-            print("==== END DEBUG INFO ====\n")
-        
-        # Try to store messages in the database if available
+        # Store messages in database if available
         if supabase_client:
             try:
-                print("⏳ Storing messages in database...")
-                start_time = datetime.now()
+                if debug:
+                    print("\n⏳ Storing messages in database...")
+                start_time = datetime.now() - timedelta(days=days)
                 message_count = supabase_client.store_messages(processed_messages, group_id)
-                print(f"✅ Stored {message_count} messages in database")
+                if debug:
+                    print(f"✅ Stored {message_count} messages in database")
             except Exception as e:
-                print(f"⚠️ Could not store messages in database: {str(e)}")
+                if debug:
+                    print(f"⚠️ Could not store messages in database: {str(e)}")
+        else:
+            if debug:
+                print("\n⚠️ Database connection not available, skipping message storage")
         
         # Generate summary
-        print("⏳ Generating summary with OpenAI...")
-        summary = openai_client.generate_summary(processed_messages)
-        print("✅ Summary generated successfully")
+        if debug:
+            print("\n⏳ Generating summary...")
         
-        # Try to store the summary in the database if available
+        # Set up a retry mechanism in case of OpenAI API errors
+        max_retries = 3
+        retry_delay = 5  # seconds
+        for attempt in range(max_retries):
+            try:
+                summary = openai_client.generate_summary(processed_messages)
+                if debug:
+                    print("✅ Summary generated successfully")
+                break
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    if debug:
+                        print(f"⚠️ Error generating summary (attempt {attempt+1}/{max_retries}): {str(e)}")
+                        print(f"Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    if debug:
+                        print(f"❌ Failed to generate summary after {max_retries} attempts: {str(e)}")
+                    return f"שגיאה בזמן יצירת הסיכום: {str(e)}"
+        
+        # Store summary in database if available
         if supabase_client:
             try:
+                if debug:
+                    print("\n⏳ Storing summary in database...")
+                
                 end_time = datetime.now()
+                start_time = end_time - timedelta(days=days)
+                
                 supabase_client.store_summary(
                     summary=summary,
                     group_id=group_id,
@@ -361,19 +341,20 @@ def generate_summary(components, group_id, days=1, debug=False):
                     message_count=len(processed_messages),
                     model_used=openai_client.model
                 )
-                print("✅ Summary stored in database")
+                
+                if debug:
+                    print("✅ Summary stored in database")
             except Exception as e:
-                print(f"⚠️ Could not store summary in database: {str(e)}")
+                if debug:
+                    print(f"⚠️ Could not store summary in database: {str(e)}")
+        else:
+            if debug:
+                print("\n⚠️ Database connection not available, skipping summary storage")
         
         return summary
         
     except Exception as e:
-        print(f"❌ Error generating summary: {str(e)}")
-        if debug:
-            import traceback
-            print("\n==== DEBUG: EXCEPTION TRACEBACK ====")
-            traceback.print_exc()
-            print("==== END TRACEBACK ====\n")
+        logger.error(f"Error generating summary: {str(e)}")
         return f"שגיאה בזמן יצירת הסיכום: {str(e)}"
 
 def select_days():
@@ -395,36 +376,59 @@ def select_days():
             print("❌ Please enter a valid number.")
 
 def send_summary(components, group_id, summary):
-    """Send the summary to the group"""
-    config_manager = components['config_manager']
+    """Send a summary to a WhatsApp group"""
     green_api_client = components['green_api_client']
+    config_manager = components['config_manager']
     
-    # Check if dry run mode is enabled
+    # FORCE DISABLE MESSAGE SENDING - SAFETY MEASURE
+    # This ensures messages are never sent accidentally
+    message_sending_disabled = True
+    
+    # Previous settings checks (now just for information)
+    config_disabled = config_manager.get('BOT_MESSAGE_SENDING_DISABLED', 'false').lower() == 'true'
     dry_run = config_manager.get('BOT_DRY_RUN', 'true').lower() == 'true'
     
+    if message_sending_disabled:
+        print("\n⛔ Message sending is currently disabled for safety.")
+        print("To enable message sending in the future, contact the developer.")
+        return False
+        
+    # This code below will never execute due to the safety measure above
+    # But we keep it for reference in case sending is re-enabled in the future
+    if config_disabled:
+        print("\n⛔ Message sending is disabled in configuration.")
+        print("To enable, set BOT_MESSAGE_SENDING_DISABLED=false in .env")
+        return False
+        
     if dry_run:
-        print("\n⚠️ DRY RUN mode is enabled in configuration.")
-        choice = input("Would you like to override and send anyway? (y/n): ")
-        if choice.lower() != 'y':
-            print("❌ Summary was not sent due to DRY RUN mode.")
+        print(f"\n⚠️ DRY RUN MODE - The summary would be sent to group {group_id}")
+        print("To actually send messages, set BOT_DRY_RUN=false in .env")
+        return False
+    
+    try:
+        # Send the summary
+        print("\n⏳ Sending summary to group...")
+        response = green_api_client.send_message(group_id, summary, is_summary=True)
+        
+        if 'idMessage' in response and not response['idMessage'].startswith(('DISABLED', 'NON-SUMMARY')):
+            print("✅ Summary sent successfully!")
+            return True
+        else:
+            print(f"❌ Failed to send summary. Response: {response}")
             return False
-    
-    print("\n⏳ Sending summary to the group...")
-    response = green_api_client.send_message(group_id, summary, is_summary=True)
-    
-    if 'idMessage' in response and not response['idMessage'].startswith(('DISABLED', 'NON-SUMMARY')):
-        print("✅ Summary sent to the group successfully!")
-        return True
-    else:
-        print(f"❌ Failed to send summary: {response.get('message', 'Unknown error')}")
+            
+    except Exception as e:
+        print(f"❌ Error sending summary: {str(e)}")
         return False
 
 def view_previous_summaries(components):
-    """View previous summaries stored in the database"""
+    """View previously stored summaries"""
     supabase_client = components['supabase_client']
     
     if not supabase_client:
         print("\n❌ Database connection not available.")
+        print("Previous summaries cannot be viewed without database access.")
+        input("\nPress Enter to continue...")
         return
     
     try:
@@ -432,72 +436,128 @@ def view_previous_summaries(components):
         summaries = supabase_client.get_summaries(limit=10)
         
         if not summaries:
-            print("❌ No previous summaries found in the database.")
+            print("\n⚠️ No summaries found in the database.")
+            input("\nPress Enter to continue...")
             return
         
-        print("\nPrevious Summaries:")
-        print("=" * 60)
-        
-        for i, summary in enumerate(summaries, 1):
-            created_at = summary.get('created_at', 'Unknown date')
-            try:
-                # Convert the timestamp string to a datetime object
-                if isinstance(created_at, str):
-                    created_at = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
-                    created_at = created_at.strftime('%Y-%m-%d %H:%M:%S')
-            except:
-                pass
-                
-            group_id = summary.get('group_id', 'Unknown group')
-            message_count = summary.get('message_count', 0)
-            
-            print(f"{i}. {created_at} - {message_count} messages")
-        
         while True:
-            selection = input("\nSelect a summary to view (number) or 'q' to go back: ")
-            if selection.lower() == 'q':
-                return
+            print_header()
+            print("Previous Summaries:")
+            print("-" * 60)
+            
+            for i, summary in enumerate(summaries, 1):
+                # Format timestamp
+                timestamp = summary.get('created_at', 'Unknown')
+                if isinstance(timestamp, str):
+                    try:
+                        dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                        timestamp = dt.strftime('%Y-%m-%d %H:%M:%S')
+                    except:
+                        pass
                 
-            try:
-                selection = int(selection.strip())
-                if selection < 1 or selection > len(summaries):
-                    print("❌ Invalid selection. Please try again.")
-                    continue
+                # Get group ID and message count
+                group_id = summary.get('group_id', 'Unknown')
+                message_count = summary.get('message_count', 0)
                 
-                # Display the selected summary
-                selected = summaries[selection-1]
-                print("\n" + "=" * 60)
-                print(f"Summary from: {selected.get('created_at', 'Unknown date')}")
-                print(f"Group ID: {selected.get('group_id', 'Unknown')}")
-                print(f"Message count: {selected.get('message_count', 0)}")
-                print(f"Model used: {selected.get('model_used', 'Unknown')}")
-                print("=" * 60)
-                print(selected.get('summary_text', 'Summary text not available'))
-                print("=" * 60)
-                
-                input("\nPress Enter to continue...")
+                # Show summary information
+                print(f"{i}. {timestamp} - Group: {group_id}")
+                print(f"   Messages: {message_count}")
+                print("-" * 60)
+            
+            print("\nOptions:")
+            print("  [number] - View summary details")
+            print("  b - Back to main menu")
+            
+            choice = input("\nEnter your choice: ")
+            
+            if choice.lower() == 'b':
                 break
+            
+            try:
+                index = int(choice) - 1
+                if 0 <= index < len(summaries):
+                    # Show the selected summary
+                    selected = summaries[index]
+                    
+                    print_header()
+                    print("Summary Details:")
+                    print("=" * 60)
+                    
+                    # Format timestamps
+                    created_at = selected.get('created_at', 'Unknown')
+                    if isinstance(created_at, str):
+                        try:
+                            dt = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                            created_at = dt.strftime('%Y-%m-%d %H:%M:%S')
+                        except:
+                            pass
+                    
+                    start_time = selected.get('start_time', 'Unknown')
+                    if isinstance(start_time, str):
+                        try:
+                            dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                            start_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+                        except:
+                            pass
+                    
+                    end_time = selected.get('end_time', 'Unknown')
+                    if isinstance(end_time, str):
+                        try:
+                            dt = datetime.fromisoformat(end_time.replace('Z', '+00:00'))
+                            end_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+                        except:
+                            pass
+                    
+                    # Show summary metadata
+                    print(f"Group ID: {selected.get('group_id', 'Unknown')}")
+                    print(f"Created: {created_at}")
+                    print(f"Period: {start_time} to {end_time}")
+                    print(f"Message Count: {selected.get('message_count', 0)}")
+                    print(f"Model: {selected.get('model_used', 'Unknown')}")
+                    print("=" * 60)
+                    
+                    # Show the summary text
+                    print("\nSUMMARY TEXT:")
+                    print("-" * 60)
+                    print(selected.get('summary_text', 'No text available'))
+                    print("-" * 60)
+                    
+                    # Ask if user wants to resend this summary
+                    resend = input("\nDo you want to resend this summary to a group? (y/n): ")
+                    if resend.lower() == 'y':
+                        # Select group
+                        group = select_group(components)
+                        if group:
+                            send_summary(components, group['id'], selected.get('summary_text', ''))
+                    
+                else:
+                    print("❌ Invalid selection")
                 
             except ValueError:
-                print("❌ Please enter a valid number.")
-            except Exception as e:
-                print(f"❌ Error: {str(e)}")
-                input("\nPress Enter to continue...")
-                break
+                print("❌ Invalid input. Please enter a number or 'b'.")
+                
+            input("\nPress Enter to continue...")
                 
     except Exception as e:
         print(f"❌ Error fetching summaries: {str(e)}")
+        input("\nPress Enter to continue...")
 
 def show_main_menu():
     """Display the main menu and handle user interaction"""
     # Initialize components
     print("⏳ Initializing components...")
-    components = initialize_components()
-    print("✅ Components initialized successfully")
+    try:
+        components = initialize_components()
+        print("✅ Components initialized successfully")
+    except Exception as e:
+        print(f"❌ Error initializing components: {str(e)}")
+        print("⚠️ Some features may be limited")
+        components = {}  # Empty components dict to allow basic menu functionality
     
     while True:
         print_header()
         print("Main Menu:")
+        # Always show all menu options regardless of component status
         print("1. Generate New Summary")
         print("2. View Previous Summaries")
         print("3. Settings")
@@ -510,6 +570,13 @@ def show_main_menu():
             # Generate New Summary
             print_header()
             print("Generate New Summary")
+            
+            # Check if necessary components are available
+            if 'group_manager' not in components or 'openai_client' not in components:
+                print("❌ Required components are not available.")
+                print("Please check your configuration and try again.")
+                input("\nPress Enter to continue...")
+                continue
             
             # Select group
             group = select_group(components)
@@ -526,24 +593,26 @@ def show_main_menu():
             debug_choice = input("\nEnable debug mode? (y/n): ")
             if debug_choice.lower() == 'y':
                 debug_mode = True
-                print("Debug mode enabled - detailed information will be shown")
             
-            # Generate summary
-            print_header()
-            print(f"Generating summary for {group['name']} ({days} day{'s' if days > 1 else ''})")
-            summary = generate_summary(components, group['id'], days=days, debug=debug_mode)
+            # Generate the summary
+            print("\n⏳ Generating summary... (this may take a minute)")
+            summary = generate_summary(components, group['id'], days, debug_mode)
             
-            # Display the summary
-            print("\n" + "=" * 60)
-            print("SUMMARY:")
-            print("=" * 60)
-            print(summary)
-            print("=" * 60)
-            
-            # Ask if user wants to send the summary
-            send = input("\nDo you want to send this summary to the group? (y/n): ")
-            if send.lower() == 'y':
-                send_summary(components, group['id'], summary)
+            if summary:
+                print("\n✅ Summary generated successfully!")
+                print("\n" + summary)
+                
+                # Ask if they want to send the summary to the group
+                send_choice = input("\nSend this summary to the group? (y/n): ")
+                if send_choice.lower() == 'y':
+                    print("\n⏳ Sending summary to group...")
+                    result = send_summary(components, group['id'], summary)
+                    if result:
+                        print("✅ Summary sent successfully!")
+                    else:
+                        print("❌ Failed to send summary to group.")
+            else:
+                print("❌ Failed to generate summary.")
             
             input("\nPress Enter to continue...")
             
@@ -551,6 +620,14 @@ def show_main_menu():
             # View Previous Summaries
             print_header()
             print("View Previous Summaries")
+            
+            # Check if database is available
+            if 'supabase_client' not in components or not components['supabase_client']:
+                print("❌ Database connection not available.")
+                print("This feature requires a database connection.")
+                input("\nPress Enter to continue...")
+                continue
+            
             view_previous_summaries(components)
             
         elif choice == '3':
@@ -708,10 +785,26 @@ def load_user_settings():
         logger.error(f"Error loading user settings: {str(e)}")
 
 if __name__ == "__main__":
+    """
+    WhatsApp Group Summary Generator Menu
+    
+    This is an interactive menu for generating and managing WhatsApp group summaries.
+    
+    Usage:
+    1. Make sure you have set up your .env file with the necessary API keys
+    2. Run the program: python summary_menu.py
+    3. Use the menu to generate summaries, view previous ones, or change settings
+    
+    Note on database errors:
+    If you encounter Supabase database errors, the program will continue to function
+    with basic features, but without storing or retrieving previous summaries.
+    """
+    # Run the main menu
     try:
         show_main_menu()
     except KeyboardInterrupt:
-        print("\n\nExiting...")
+        print("\n\nProgram terminated by user.")
     except Exception as e:
-        print(f"\n❌ Unexpected error: {str(e)}")
-        logger.error(f"Unexpected error: {str(e)}") 
+        print(f"\n\nAn unexpected error occurred: {str(e)}")
+        
+    print("\nGoodbye!") 
