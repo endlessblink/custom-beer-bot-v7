@@ -265,18 +265,46 @@ def run_main_menu():
                             
                             # Send summary with retry
                             max_send_retries = 3
-                            for attempt in range(max_send_retries):
-                                if send_summary(components, group['id'], summary):
-                                    logger.info("Summary sent successfully")
-                                    print("\n✅ Summary sent successfully!")
-                                    break
-                                elif attempt < max_send_retries - 1:
+                            send_result = send_summary(components, group['id'], summary)
+                            
+                            # Handle different send_summary result values
+                            if send_result is True:
+                                # Success on first try
+                                logger.info("Summary sent successfully")
+                                print("\n✅ Summary sent successfully!")
+                            elif send_result is None:
+                                # User explicitly declined to send
+                                logger.info("User declined to send summary - not retrying")
+                                print("\nSummary not sent per user request")
+                            elif send_result is False:
+                                # Technical error - retry
+                                retry_success = False
+                                for attempt in range(max_send_retries - 1):  # -1 because we already tried once
                                     logger.warning(f"Retrying summary send (attempt {attempt + 2}/{max_send_retries})")
                                     time.sleep(2)  # Wait before retry
-                                else:
+                                    retry_result = send_summary(components, group['id'], summary)
+                                    
+                                    # Check each retry result
+                                    if retry_result is True:
+                                        logger.info("Summary sent successfully on retry")
+                                        print("\n✅ Summary sent successfully on retry!")
+                                        retry_success = True
+                                        break
+                                    elif retry_result is None:
+                                        # User declined on retry - don't continue retrying
+                                        logger.info("User declined to send summary during retry - stopping retries")
+                                        print("\nSummary not sent per user request")
+                                        retry_success = True  # Mark as handled
+                                        break
+                                
+                                if not retry_success:
                                     logger.error("Failed to send summary after all retries")
-                                    print("\n❌ Failed to send summary")
-                            
+                                    print("\n❌ Failed to send summary after multiple attempts")
+                            else:
+                                # Other unexpected return value - don't retry
+                                logger.warning(f"Unexpected return value from send_summary: {send_result}")
+                                print("\n❌ Unexpected error when sending summary")
+                        
                         except Exception as e:
                             logger.error(f"Error in summary generation flow: {str(e)}", exc_info=True)
                             print(f"\n❌ Error: {str(e)}")

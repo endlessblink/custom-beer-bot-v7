@@ -18,6 +18,8 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import json
 import time
+import uuid
+import openai
 
 from config.config_manager import ConfigManager
 from green_api.client import GreenAPIClient
@@ -240,38 +242,173 @@ def generate_summary(components, group_id, days=1, debug=False):
     supabase_client = components['supabase_client']
     
     try:
+        print(f"\nGenerating summary for the last {days} days using fresh WhatsApp messages...")
+        logger.info(f"Starting summary generation process")
+        logger.info(f"Generating summary for the last {days} days using fresh WhatsApp messages...")
+
         # Fetch recent messages
         if debug:
             print("\n⏳ Fetching messages...")
+        logger.info(f"Fetching messages from API for group {group_id}")
         messages = green_api_client.get_chat_history(group_id)
         
         if not messages:
+            logger.warning("No messages found from API")
             if debug:
                 print("❌ No messages found")
             return "אין הודעות לסיכום."
         
+        logger.info(f"Retrieved {len(messages)} messages from API")
         if debug:
             print(f"✅ Found {len(messages)} messages")
             
             # Print a sample message
             if messages:
-                print("\nSample message:")
-                sample = json.dumps(messages[0], indent=2, ensure_ascii=False)
-                # Truncate sample if too long
-                if len(sample) > 500:
-                    sample = sample[:500] + "..."
-                print(sample)
+                print("\nSample message structure:")
+                sample_msg = messages[0]
+                # Print only the keys to avoid overwhelming output
+                print(f"Message keys: {list(sample_msg.keys())}")
+                print("\nTimestamp information:")
+                if 'timestamp' in sample_msg:
+                    ts = sample_msg['timestamp']
+                    print(f"- Timestamp value: {ts}")
+                    print(f"- Timestamp type: {type(ts).__name__}")
+                    # Try to interpret the timestamp
+                    if isinstance(ts, int) or isinstance(ts, float):
+                        try:
+                            as_seconds = datetime.fromtimestamp(ts)
+                            print(f"- As seconds since epoch: {as_seconds}")
+                        except:
+                            print("- Failed to interpret as seconds since epoch")
+                        try:
+                            as_milliseconds = datetime.fromtimestamp(ts / 1000)
+                            print(f"- As milliseconds since epoch: {as_milliseconds}")
+                        except:
+                            print("- Failed to interpret as milliseconds since epoch")
+                else:
+                    print("- No timestamp field found in the message")
+                
+                # Print other relevant fields
+                print("\nOther key fields:")
+                for key in ['senderName', 'textMessage', 'senderId', 'type']:
+                    if key in sample_msg:
+                        print(f"- {key}: {sample_msg[key]}")
+        
+        # Filter messages by date
+        cutoff_date = datetime.now() - timedelta(days=days)
+        logger.info(f"Filtering messages since {cutoff_date}")
+        
+        # Manual filtering (bypassing the filter_messages_by_date function to debug the issue)
+        filtered_messages = []
+        timestamp_issues = []
+        
+        for message in messages:
+            try:
+                if 'timestamp' not in message:
+                    continue
+                    
+                ts = message['timestamp']
+                msg_date = None
+                
+                # Handle Unix timestamp (integer)
+                if isinstance(ts, int) or isinstance(ts, float):
+                    try:
+                        # Try as seconds since epoch
+                        msg_date = datetime.fromtimestamp(ts)
+                    except Exception as e1:
+                        try:
+                            # Try as milliseconds since epoch
+                            msg_date = datetime.fromtimestamp(ts / 1000)
+                        except Exception as e2:
+                            timestamp_issues.append(f"Couldn't parse timestamp {ts}: {str(e2)}")
+                            continue
+                
+                # Handle string timestamps
+                elif isinstance(ts, str):
+                    try:
+                        # Try parsing with timezone info
+                        msg_date = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                        # Convert to naive datetime for comparison
+                        msg_date = msg_date.replace(tzinfo=None)
+                    except Exception as e1:
+                        try:
+                            # Try parsing without timezone info
+                            msg_date = datetime.fromisoformat(ts)
+                        except Exception as e2:
+                            try:
+                                # Try parsing with standard format
+                                msg_date = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                            except Exception as e3:
+                                timestamp_issues.append(f"Couldn't parse string timestamp {ts}")
+                                continue
+                
+                # Handle datetime objects
+                elif isinstance(ts, datetime):
+                    msg_date = ts.replace(tzinfo=None) if ts.tzinfo else ts
+                else:
+                    timestamp_issues.append(f"Unsupported timestamp type: {type(ts).__name__}")
+                    continue
+                
+                # Check if message is within the time range
+                if msg_date and msg_date >= cutoff_date:
+                    filtered_messages.append(message)
+            except Exception as e:
+                timestamp_issues.append(f"Error processing message: {str(e)}")
+        
+        # Log filtering results
+        logger.info(f"Filtered {len(filtered_messages)} messages out of {len(messages)}")
+        
+        if debug:
+            print(f"\nFiltered messages: {len(filtered_messages)} out of {len(messages)}")
+            if timestamp_issues:
+                print("\nTimestamp parsing issues:")
+                for i, issue in enumerate(timestamp_issues[:5]):  # Show only first 5 issues
+                    print(f"{i+1}. {issue}")
+                if len(timestamp_issues) > 5:
+                    print(f"... and {len(timestamp_issues) - 5} more issues")
+        
+        if not filtered_messages:
+            logger.warning(f"No messages found in the last {days} days")
+            if debug:
+                print("❌ No messages found in the specified time period")
+            return "אין הודעות בטווח הזמן המבוקש."
         
         # Process messages
         if debug:
             print("\n⏳ Processing messages...")
-        processed_messages = message_processor.process_messages(messages)
+            # Enable debug mode on the message processor to get detailed logs
+            if hasattr(message_processor, 'set_debug_mode'):
+                message_processor.set_debug_mode(True)
+            
+        # Add a sample message log for debugging
+        if debug and filtered_messages:
+            print("\nSample message to be processed:")
+            print(f"- Message ID: {filtered_messages[0].get('idMessage', 'Unknown')}")
+            print(f"- Message keys: {list(filtered_messages[0].keys())}")
+            if 'timestamp' in filtered_messages[0]:
+                print(f"- Timestamp: {filtered_messages[0]['timestamp']}")
+            if 'senderName' in filtered_messages[0]:
+                print(f"- Sender: {filtered_messages[0]['senderName']}")
+            if 'textMessage' in filtered_messages[0]:
+                print(f"- Text: {filtered_messages[0]['textMessage'][:50]}...")
+            if 'extendedTextMessage' in filtered_messages[0]:
+                print("- Has extendedTextMessage field")
+                
+        processed_messages = message_processor.process_messages(filtered_messages)
         
         if not processed_messages:
+            logger.warning("No valid messages after processing")
             if debug:
                 print("❌ No valid messages after processing")
+                print("Common reasons for message rejection:")
+                print("- Messages start with command prefixes (/, !, .)")
+                print("- Messages have empty text content")
+                print("- Messages have unsupported formats")
+                print("- The message processing logic can't extract text from the message format")
+                print("\nCheck the application logs for detailed rejection reasons.")
             return "אין הודעות תקפות לסיכום אחרי עיבוד."
         
+        logger.info(f"Successfully processed {len(processed_messages)} messages")
         if debug:
             print(f"✅ Processed {len(processed_messages)} valid messages")
             
@@ -294,35 +431,97 @@ def generate_summary(components, group_id, days=1, debug=False):
                 if debug:
                     print(f"✅ Stored {message_count} messages in database")
             except Exception as e:
+                logger.warning(f"Failed to store messages in database: {str(e)}")
                 if debug:
                     print(f"⚠️ Could not store messages in database: {str(e)}")
         else:
             if debug:
                 print("\n⚠️ Database connection not available, skipping message storage")
         
-        # Generate summary
-        if debug:
-            print("\n⏳ Generating summary...")
-        
-        # Set up a retry mechanism in case of OpenAI API errors
+        # Generate the summary
         max_retries = 3
         retry_delay = 5  # seconds
+        
+        if debug:
+            print("\n⏳ Generating summary with OpenAI...")
+        logger.info("Generating summary using OpenAI")
+        
+        # Check if we have something to summarize
+        if not processed_messages:
+            logger.error("No processed messages available for summarization")
+            if debug:
+                print("❌ No messages available for summarization")
+            return "אין הודעות זמינות לסיכום."
+        
+        # Log message count and date range for clarity
+        logger.info(f"Attempting to summarize {len(processed_messages)} messages")
+        
+        if debug:
+            # Show date range of messages being summarized
+            try:
+                if processed_messages:
+                    dates = []
+                    for msg in processed_messages:
+                        if 'timestamp' in msg:
+                            if isinstance(msg['timestamp'], str):
+                                try:
+                                    dates.append(datetime.fromisoformat(msg['timestamp'].replace('Z', '+00:00')))
+                                except:
+                                    pass
+                    if dates:
+                        earliest = min(dates)
+                        latest = max(dates)
+                        print(f"Message date range: {earliest} to {latest}")
+            except Exception as e:
+                print(f"Error analyzing message dates: {str(e)}")
+        
+        summary = None
+        
+        # Generate summary with retries
         for attempt in range(max_retries):
             try:
                 summary = openai_client.generate_summary(processed_messages)
-                if debug:
-                    print("✅ Summary generated successfully")
+                
+                # Log summary info for debugging
+                if summary and len(summary) > 0:
+                    summary_preview = summary[:50] + "..." if len(summary) > 50 else summary
+                    logger.info(f"Summary generated successfully: {len(summary)} chars")
+                    logger.info(f"Summary preview: {summary_preview}")
+                    if debug:
+                        print("✅ Summary generated successfully")
+                else:
+                    logger.warning("OpenAI returned empty summary")
+                    if debug:
+                        print("⚠️ OpenAI returned empty summary")
+                
                 break
             except Exception as e:
+                logger.warning(f"Error generating summary (attempt {attempt+1}/{max_retries}): {str(e)}")
                 if attempt < max_retries - 1:
                     if debug:
                         print(f"⚠️ Error generating summary (attempt {attempt+1}/{max_retries}): {str(e)}")
                         print(f"Retrying in {retry_delay} seconds...")
                     time.sleep(retry_delay)
                 else:
+                    logger.error(f"Failed to generate summary after {max_retries} attempts: {str(e)}")
                     if debug:
                         print(f"❌ Failed to generate summary after {max_retries} attempts: {str(e)}")
                     return f"שגיאה בזמן יצירת הסיכום: {str(e)}"
+        
+        # Validate the summary
+        if not summary or summary.strip() == "":
+            logger.error("Invalid summary generated")
+            if debug:
+                print("❌ Summary is empty or invalid")
+            return "נכשל ביצירת סיכום תקף."
+            
+        # Print summary preview
+        if debug:
+            print("\nSummary Preview:")
+            preview_lines = summary.split('\n')[:5]  # First 5 lines
+            print('\n'.join(preview_lines))
+            if len(summary.split('\n')) > 5:
+                print("...")
         
         # Store summary in database if available
         if supabase_client:
@@ -333,29 +532,61 @@ def generate_summary(components, group_id, days=1, debug=False):
                 end_time = datetime.now()
                 start_time = end_time - timedelta(days=days)
                 
-                supabase_client.store_summary(
-                    summary=summary,
-                    group_id=group_id,
-                    start_time=start_time,
-                    end_time=end_time,
-                    message_count=len(processed_messages),
-                    model_used=openai_client.model
-                )
+                try:
+                    supabase_client.store_summary(
+                        summary=summary,
+                        group_id=group_id,
+                        start_time=start_time,
+                        end_time=end_time,
+                        message_count=len(processed_messages),
+                        model_used=openai_client.model
+                    )
+                    logger.info("Summary stored in database successfully")
+                    if debug:
+                        print("✅ Summary stored in database")
+                except Exception as e:
+                    logger.warning(f"Primary storage method failed: {str(e)}")
+                    if debug:
+                        print(f"⚠️ Primary storage method failed, trying alternate method...")
+                    
+                    # Try alternate method with client.from_
+                    supabase_client.client.from_('summaries').insert({
+                        'id': str(uuid.uuid4()),
+                        'group_id': group_id,
+                        'content': summary,
+                        'generated_at': datetime.now().isoformat(),
+                        'start_time': start_time.isoformat(),
+                        'end_time': end_time.isoformat(),
+                        'message_count': len(processed_messages),
+                        'model_used': openai_client.model
+                    }).execute()
+                    
+                    logger.info("Summary stored in database using alternative method")
+                    if debug:
+                        print("✅ Summary stored in database (alternative method)")
                 
-                if debug:
-                    print("✅ Summary stored in database")
             except Exception as e:
+                logger.error(f"Could not store summary in database: {str(e)}")
                 if debug:
                     print(f"⚠️ Could not store summary in database: {str(e)}")
         else:
+            logger.info("Skipping summary storage (no database connection)")
             if debug:
                 print("\n⚠️ Database connection not available, skipping summary storage")
         
+        logger.info("Summary generation completed successfully")
         return summary
         
     except Exception as e:
-        logger.error(f"Error generating summary: {str(e)}")
-        return f"שגיאה בזמן יצירת הסיכום: {str(e)}"
+        logger.error(f"Error generating summary: {str(e)}", exc_info=True)
+        if debug:
+            print(f"\n❌ Error: {str(e)}")
+            
+            # Show detailed traceback in debug mode
+            import traceback
+            traceback.print_exc()
+            
+        return None
 
 def select_days():
     """Select the number of days to summarize"""
@@ -391,19 +622,22 @@ def send_summary(components, group_id, summary):
     if message_sending_disabled:
         print("\n⛔ Message sending is currently disabled for safety.")
         print("To enable message sending in the future, contact the developer.")
-        return False
-        
+        send_anyway = input("\nDo you want to try to send the message anyway? (y/n): ")
+        if send_anyway.lower() != 'y':
+            return None  # User declined to send
+        # Continue trying if user insists
+    
     # This code below will never execute due to the safety measure above
     # But we keep it for reference in case sending is re-enabled in the future
     if config_disabled:
         print("\n⛔ Message sending is disabled in configuration.")
         print("To enable, set BOT_MESSAGE_SENDING_DISABLED=false in .env")
-        return False
+        return None  # This is disabled by configuration
         
     if dry_run:
         print(f"\n⚠️ DRY RUN MODE - The summary would be sent to group {group_id}")
         print("To actually send messages, set BOT_DRY_RUN=false in .env")
-        return False
+        return None  # This is a dry run
     
     try:
         # Send the summary
@@ -596,23 +830,81 @@ def show_main_menu():
             
             # Generate the summary
             print("\n⏳ Generating summary... (this may take a minute)")
-            summary = generate_summary(components, group['id'], days, debug_mode)
-            
-            if summary:
-                print("\n✅ Summary generated successfully!")
-                print("\n" + summary)
+            try:
+                summary = generate_summary(components, group['id'], days, debug_mode)
                 
-                # Ask if they want to send the summary to the group
-                send_choice = input("\nSend this summary to the group? (y/n): ")
-                if send_choice.lower() == 'y':
-                    print("\n⏳ Sending summary to group...")
-                    result = send_summary(components, group['id'], summary)
-                    if result:
-                        print("✅ Summary sent successfully!")
-                    else:
-                        print("❌ Failed to send summary to group.")
-            else:
-                print("❌ Failed to generate summary.")
+                if summary:
+                    print("\n✅ Summary generated successfully!")
+                    
+                    # Display the summary with a more visible frame
+                    print("\n" + "*" * 70)
+                    print("*" + " " * 24 + "GENERATED SUMMARY" + " " * 24 + "*")
+                    print("*" * 70)
+                    print()
+                    
+                    # Split by lines for better visibility
+                    for line in summary.split('\n'):
+                        print("  " + line)
+                    
+                    print()
+                    print("*" * 70)
+                    print()
+                    
+                    # Ask if they want to send the summary to the group
+                    send_choice = input("\nSend this summary to the group? (y/n): ")
+                    if send_choice.lower() == 'y':
+                        print("\n⏳ Sending summary to group...")
+                        result = send_summary(components, group['id'], summary)
+                        if result:
+                            print("✅ Summary sent successfully!")
+                        else:
+                            print("❌ Failed to send summary to group.")
+                else:
+                    print("\n❌ Failed to generate summary.")
+                    print("The summary generation process failed. This might be because:")
+                    print("- No messages were found in the group")
+                    print("- No messages matched the date range")
+                    print("- All messages were filtered out during processing")
+                    print("- There was an error during the OpenAI API call")
+                    print("\nTry running again with debug mode enabled for more detailed information.")
+            except ValueError as e:
+                print(f"\n❌ Validation Error: {str(e)}")
+                print("\nThis error occurred during input validation. Please check:")
+                print("- The message data structure")
+                print("- Whether there are any valid messages in the specified time period")
+                print("- If the OpenAI API returned empty or invalid response")
+                logger.error(f"Validation error in show_main_menu: {str(e)}", exc_info=True)
+            except openai.APIError as e:
+                print(f"\n❌ OpenAI API Error: {str(e)}")
+                print("\nThis is a general error from the OpenAI API. Please check:")
+                print("- Your internet connection")
+                print("- OpenAI service status")
+                print("- Your API key configuration")
+                logger.error(f"OpenAI API error in show_main_menu: {str(e)}", exc_info=True)
+            except openai.RateLimitError as e:
+                print(f"\n❌ OpenAI Rate Limit Exceeded: {str(e)}")
+                print("\nYou've hit the OpenAI API rate limit. Please:")
+                print("- Wait a few minutes before trying again")
+                print("- Consider upgrading your OpenAI plan if this happens frequently")
+                logger.error(f"OpenAI rate limit error in show_main_menu: {str(e)}", exc_info=True)
+            except openai.APIConnectionError as e:
+                print(f"\n❌ OpenAI Connection Error: {str(e)}")
+                print("\nCould not connect to the OpenAI API. Please check:")
+                print("- Your internet connection")
+                print("- Any network firewalls or proxy settings")
+                logger.error(f"OpenAI connection error in show_main_menu: {str(e)}", exc_info=True)
+            except openai.InvalidRequestError as e:
+                print(f"\n❌ Invalid OpenAI Request: {str(e)}")
+                print("\nThe request to OpenAI was invalid. This might be because:")
+                print("- The message data contains invalid characters")
+                print("- The prompt is too long (too many messages)")
+                print("- There's an issue with your API key")
+                logger.error(f"OpenAI invalid request error in show_main_menu: {str(e)}", exc_info=True)
+            except Exception as e:
+                print(f"\n❌ Error during summary generation: {str(e)}")
+                print("The summary generation process encountered an error.")
+                print("Try running again with debug mode enabled for more detailed information.")
+                logger.error(f"Uncaught error in show_main_menu: {str(e)}", exc_info=True)
             
             input("\nPress Enter to continue...")
             
