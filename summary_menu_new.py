@@ -131,24 +131,40 @@ class BackgroundBot:
                 target_group_id = source_group_id
                 target_type = "source"
             
+            # Get group names for better display
+            source_group_name = "Unknown"
+            target_group_name = "Unknown"
+            
+            try:
+                group_manager = self.components.get('group_manager')
+                if group_manager:
+                    groups = group_manager.get_groups()
+                    for group in groups:
+                        if group['id'] == source_group_id:
+                            source_group_name = group['name']
+                        if group['id'] == target_group_id:
+                            target_group_name = group['name']
+            except Exception as e:
+                self.logger.warning(f"Could not retrieve group names: {str(e)}")
+            
             # First, fetch new messages from the source group
-            print(f"⏳ Fetching new messages from the source group ({source_group_id})...")
-            auto_fetch_new_messages(self.components, group_id=source_group_id)
+            print(f"⏳ Fetching new messages from source group: {source_group_name} ({source_group_id})...")
+            auto_fetch_new_messages(self.components, group_id=source_group_id, background_mode=True)
             
             # Generate summary for the last 24 hours from the source group
             days = 1
             debug_mode = False
-            summary = generate_summary(self.components, source_group_id, days, debug_mode)
+            summary = generate_summary(self.components, source_group_id, days, debug_mode, background_mode=True)
             
             if summary:
                 print("\n✅ Summary generated successfully!")
                 
                 # Send to the appropriate target group
-                print(f"⏳ Sending summary to {target_type} group ({target_group_id})...")
-                send_summary(self.components, target_group_id, summary)
+                print(f"⏳ Sending summary to {target_type} group: {target_group_name} ({target_group_id})...")
+                send_summary(self.components, target_group_id, summary, background_mode=True)
                 print("✅ Summary sent successfully!")
                 
-                self.logger.info(f"Scheduled summary sent: Source={source_group_id}, Target={target_group_id}")
+                self.logger.info(f"Scheduled summary sent: Source={source_group_name} ({source_group_id}), Target={target_group_name} ({target_group_id})")
             else:
                 print("❌ Failed to generate summary")
                 self.logger.error("Failed to generate scheduled summary")
@@ -178,9 +194,37 @@ class BackgroundBot:
         self.scheduler_thread.daemon = True
         self.scheduler_thread.start()
         
+        # Get group names for better display
+        source_group_name = "Unknown"
+        target_group_name = "Unknown"
+        test_group_name = "Unknown"
+        
+        try:
+            group_manager = self.components.get('group_manager')
+            if group_manager:
+                groups = group_manager.get_groups()
+                for group in groups:
+                    if group['id'] == self.source_group_id:
+                        source_group_name = group['name']
+                    if self.target_group_id and group['id'] == self.target_group_id:
+                        target_group_name = group['name']
+                    if self.test_group_id and group['id'] == self.test_group_id:
+                        test_group_name = group['name']
+        except Exception as e:
+            self.logger.warning(f"Could not retrieve group names: {str(e)}")
+        
         print("✅ Bot is now running in the background")
         print(f"📅 {'Scheduled to post daily at ' + self.scheduled_time if self.scheduled_time else 'No scheduled posting configured'}")
-        print(f"🧪 {'Using test group for summaries' if self.test_group_id else 'Using real group for summaries'}")
+        
+        if self.test_group_id:
+            print(f"📥 Source: {source_group_name} ({self.source_group_id})")
+            print(f"📤 Target: {test_group_name} ({self.test_group_id}) [TEST MODE]")
+        elif self.target_group_id:
+            print(f"📥 Source: {source_group_name} ({self.source_group_id})")
+            print(f"📤 Target: {target_group_name} ({self.target_group_id})")
+        else:
+            print(f"📥 Source & Target: {source_group_name} ({self.source_group_id})")
+            
         print("\nPress Ctrl+C to stop the bot")
         
         # Keep the main thread alive until interrupted
@@ -283,7 +327,7 @@ def select_group(components):
         
         # Display the groups
         group_options = [
-            {'key': str(i+1), 'text': group['name'], 'group': group}
+            {'key': str(i+1), 'text': f"{group['name']} ({group['id']})", 'group': group}
             for i, group in enumerate(groups)
         ]
         
@@ -342,7 +386,7 @@ def select_days():
             print("\n❌ Invalid choice. Please try again.")
             time.sleep(1)
 
-def generate_summary(components, group_id, days=1, debug=False):
+def generate_summary(components, group_id, days=1, debug=False, background_mode=False):
     """Generate a summary of group messages"""
     try:
         green_api_client = components.get('green_api_client')
@@ -634,8 +678,10 @@ def generate_summary(components, group_id, days=1, debug=False):
                         print(f"{i+1}. [{msg_type}] {sender}: {text[:50]}...")
             
             # Ask if the user wants to continue with the limited number of messages
-            if not confirm_action("Continue with the limited number of messages?"):
+            if not background_mode and not confirm_action("Continue with the limited number of messages?"):
                 return None
+            elif background_mode:
+                print("\n🤖 Running in background mode - automatically continuing with limited messages")
         else:
             print(f"\n✅ Successfully processed {len(processed_messages)} messages for summarization")
             
@@ -653,68 +699,49 @@ def generate_summary(components, group_id, days=1, debug=False):
                 if debug:
                     print(f"\n⚠️ Database error: {str(e)}")
         
-        # Generate the summary
-        print(f"\n⏳ Generating summary with OpenAI from {len(processed_messages)} messages...")
-        
-        # סינון הודעות לפי טווח התאריכים שנבחר
-        filtered_messages = []
-        
-        # חישוב התאריך המינימלי על פי הפרמטר days
-        now = datetime.now()
-        min_date = now - timedelta(days=days)
-        print(f"\n📅 Filtering messages from the last {days} days (since {min_date.strftime('%Y-%m-%d')})")
-        
-        # מעבר על ההודעות וסינון לפי תאריך
-        filtered_count = 0
-        for msg in processed_messages:
-            msg_timestamp = None
+        # Filter messages by date if days parameter is specified
+        if days > 0:
+            # Calculate the start date (days ago)
+            days_ago = datetime.now() - timedelta(days=days)
+            print(f"\n📅 Filtering messages from the last {days} days (since {days_ago.strftime('%Y-%m-%d')})")
             
-            # ניסיון לחלץ את התאריך בפורמטים שונים
-            if 'timestamp' in msg:
-                timestamp = msg['timestamp']
-                try:
-                    if isinstance(timestamp, str):
-                        if timestamp.isdigit():
-                            # Unix timestamp as string
-                            msg_timestamp = datetime.fromtimestamp(int(timestamp))
+            # Filter messages
+            filtered_messages = []
+            total_messages = len(processed_messages)
+            print("\nFiltering messages by date:")
+            print("[" + "-" * 50 + "]")
+            progress = 0
+            
+            for i, msg in enumerate(processed_messages):
+                # Update progress bar every message
+                new_progress = int((i + 1) / total_messages * 50)
+                if new_progress > progress:
+                    progress = new_progress
+                    print("\r[" + "=" * progress + "-" * (50 - progress) + f"] {int((i + 1) / total_messages * 100)}%", end="", flush=True)
+                
+                if 'timestamp' in msg and msg['timestamp']:
+                    try:
+                        # Convert timestamp to datetime if it's a number
+                        if isinstance(msg['timestamp'], (int, float)):
+                            msg_time = datetime.fromtimestamp(msg['timestamp'])
+                        # If it's already a datetime, use it as is
+                        elif isinstance(msg['timestamp'], datetime):
+                            msg_time = msg['timestamp']
                         else:
-                            # ISO format string
-                            try:
-                                msg_timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                            except ValueError:
-                                try:
-                                    # Try with other common formats
-                                    msg_timestamp = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
-                                except ValueError:
-                                    pass
-                    elif isinstance(timestamp, int) or isinstance(timestamp, float):
-                        # Unix timestamp as int/float
-                        msg_timestamp = datetime.fromtimestamp(timestamp)
-                    
-                    # בדיקה אם התאריך בטווח המבוקש
-                    if msg_timestamp and msg_timestamp >= min_date:
-                        filtered_messages.append(msg)
-                        filtered_count += 1
-                except Exception as e:
-                    # אם יש בעיה בפירוש התאריך, נכלול את ההודעה כברירת מחדל
-                    if debug:
-                        print(f"Error parsing timestamp {timestamp}: {str(e)}")
-                    filtered_messages.append(msg)
-            else:
-                # אם אין חותמת זמן, נכלול את ההודעה כברירת מחדל
-                filtered_messages.append(msg)
-        
-        print(f"✅ Filtered {filtered_count} messages from the last {days} days (out of {len(processed_messages)} total)")
-        
-        # אם אין מספיק הודעות, נציג אזהרה ונשתמש בכל ההודעות
-        min_expected = 50
-        if len(filtered_messages) < min_expected:
-            print(f"⚠️ Warning: Only {len(filtered_messages)} messages found in the specified time range.")
-            if confirm_action(f"Continue with only {len(filtered_messages)} messages? (No to use all {len(processed_messages)} messages)"):
-                print(f"Using {len(filtered_messages)} messages from the specified time range.")
-            else:
-                print(f"Using all {len(processed_messages)} messages regardless of date.")
-                filtered_messages = processed_messages
+                            continue
+                        
+                        if msg_time >= days_ago:
+                            filtered_messages.append(msg)
+                    except:
+                        continue
+            
+            print("\n")  # New line after progress bar
+            print(f"✅ Filtered {len(filtered_messages)} messages from the last {days} days (out of {len(processed_messages)} total)")
+            
+            messages_for_summary = filtered_messages
+        else:
+            # Use all messages if no date filtering
+            messages_for_summary = processed_messages
         
         # Add a cache-busting timestamp to ensure we get a fresh summary
         cache_buster = datetime.now().strftime('%Y%m%d%H%M%S')
@@ -737,13 +764,13 @@ def generate_summary(components, group_id, days=1, debug=False):
             try:
                 # Add cache buster to the custom prompt
                 custom_prompt += f"\n\nTimestamp: {cache_buster}"
-                summary = openai_client.generate_summary(filtered_messages, custom_instructions=custom_instructions, target_language='hebrew')
+                summary = openai_client.generate_summary(messages_for_summary, custom_instructions=custom_instructions, target_language='hebrew')
                 print(f"\n✅ Summary generated with custom prompt")
             except Exception as e:
                 print(f"\n❌ Error generating summary with custom prompt: {str(e)}")
                 if confirm_action("Try with default prompt instead?"):
                     print("\n⏳ Generating summary with default prompt...")
-                    summary = openai_client.generate_summary(filtered_messages, target_language='hebrew')
+                    summary = openai_client.generate_summary(messages_for_summary, target_language='hebrew')
                 else:
                     display_error_and_continue(f"Failed to generate summary: {str(e)}")
                     return None
@@ -751,8 +778,28 @@ def generate_summary(components, group_id, days=1, debug=False):
             try:
                 # Always force a new summary by using cache busting timestamp
                 print("\n⏳ Generating fresh summary... הסיכום יהיה עדכני למועד הנוכחי")
+                print("\nProcessing messages for summary:")
+                print("[" + "-" * 50 + "]")
+                
+                # Initialize progress counter
+                total_msgs = len(messages_for_summary)
+                progress_step = max(1, total_msgs // 50)  # Update every 2%
+                last_progress = 0
+                
+                def progress_callback(current, total):
+                    nonlocal last_progress
+                    progress = int(current / total * 50)
+                    if progress > last_progress:
+                        last_progress = progress
+                        print("\r[" + "=" * progress + "-" * (50 - progress) + f"] {int(current / total * 100)}%", end="", flush=True)
+                
                 # Use the timestamp parameter for cache busting
-                summary = openai_client.generate_summary(filtered_messages, target_language='hebrew')
+                summary = openai_client.generate_summary(
+                    messages_for_summary,
+                    target_language='hebrew',
+                    progress_callback=progress_callback
+                )
+                print("\n")  # New line after progress bar
                 print(f"\n✅ Summary generated successfully")
                 
                 # Check summary quality by looking for too many "not reported" entries
@@ -778,9 +825,9 @@ def generate_summary(components, group_id, days=1, debug=False):
                 if "maximum context length" in error_msg.lower():
                     print("\nThe input might be too large for the model. Trying with fewer messages...")
                     # Try with half the messages
-                    half_count = len(filtered_messages) // 2
+                    half_count = len(messages_for_summary) // 2
                     try:
-                        reduced_messages = filtered_messages[:half_count]
+                        reduced_messages = messages_for_summary[:half_count]
                         print(f"\n⏳ Retrying with {half_count} messages...")
                         summary = openai_client.generate_summary(reduced_messages, target_language='hebrew')
                         print(f"\n✅ Summary generated successfully with reduced message count")
@@ -795,10 +842,10 @@ def generate_summary(components, group_id, days=1, debug=False):
         # Store the summary in the database if available
         if supabase_client:
             try:
-                if filtered_messages and len(filtered_messages) > 0:
+                if messages_for_summary and len(messages_for_summary) > 0:
                     # חישוב תאריכי התחלה וסיום לסיכום בהתבסס על ההודעות המסוננות
                     timestamps = []
-                    for msg in filtered_messages:
+                    for msg in messages_for_summary:
                         if 'timestamp' in msg and msg['timestamp']:
                             try:
                                 # נסה לפענח את החותמת בדרכים שונות
@@ -815,8 +862,8 @@ def generate_summary(components, group_id, days=1, debug=False):
                                 pass
                     
                     # חישוב התאריכים על סמך חותמות הזמן
-                    start_time = datetime.fromtimestamp(min(timestamps)) if timestamps else now - timedelta(days=days)
-                    end_time = datetime.fromtimestamp(max(timestamps)) if timestamps else now
+                    start_time = datetime.fromtimestamp(min(timestamps)) if timestamps else datetime.now() - timedelta(days=days)
+                    end_time = datetime.fromtimestamp(max(timestamps)) if timestamps else datetime.now()
                     
                     print(f"\n📅 Summary covers from {start_time.strftime('%Y-%m-%d %H:%M')} to {end_time.strftime('%Y-%m-%d %H:%M')}")
                 else:
@@ -828,7 +875,7 @@ def generate_summary(components, group_id, days=1, debug=False):
                 # עיבוד רשימת המשתתפים
                 participants = []
                 participants_set = set()
-                for msg in filtered_messages:
+                for msg in messages_for_summary:
                     sender = msg.get('senderName')
                     if sender and sender != 'Unknown' and sender not in participants_set:
                         participants_set.add(sender)
@@ -840,7 +887,7 @@ def generate_summary(components, group_id, days=1, debug=False):
                     group_id=group_id,
                     start_time=start_time,
                     end_time=end_time,
-                    message_count=len(filtered_messages),
+                    message_count=len(messages_for_summary),
                     model_used=openai_client.model
                 )
                 print("\n✅ Stored summary in database")
@@ -860,50 +907,61 @@ def generate_summary(components, group_id, days=1, debug=False):
             print("\nTraceback printed for debugging")
         return None
 
-def send_summary(components, group_id, summary):
+def send_summary(components, group_id, summary, background_mode=False):
     """Send a summary to a WhatsApp group"""
-    green_api_client = components.get('green_api_client')
-    config_manager = components.get('config_manager')
-    
-    if not green_api_client or not config_manager:
-        display_error_and_continue("Missing required components for sending summary")
-        return False
-    
-    # FORCE DISABLE MESSAGE SENDING - SAFETY MEASURE
-    # This ensures messages are never sent accidentally
-    message_sending_disabled = True
-    
-    # Previous settings checks (now just for information)
-    config_disabled = config_manager.get('BOT_MESSAGE_SENDING_DISABLED', 'false').lower() == 'true'
-    dry_run = config_manager.get('BOT_DRY_RUN', 'true').lower() == 'true'
-    
-    if message_sending_disabled:
-        print("\n⛔ Message sending is currently disabled for safety.")
-        print("To enable message sending in the future, contact the developer.")
+    if not summary:
+        print("\n❌ No summary to send")
         return False
         
-    # This code below will never execute due to the safety measure above
-    # But we keep it for reference in case sending is re-enabled in the future
-    if config_disabled:
-        print("\n⛔ Message sending is disabled in configuration.")
-        print("To enable, set BOT_MESSAGE_SENDING_DISABLED=false in .env")
-        return False
-        
-    if dry_run:
-        print(f"\n⚠️ DRY RUN MODE - The summary would be sent to group {group_id}")
-        print("To actually send messages, set BOT_DRY_RUN=false in .env")
-        return False
-    
     try:
-        # Send the summary
-        print("\n⏳ Sending summary to group...")
-        response = green_api_client.send_message(group_id, summary, is_summary=True)
+        green_api_client = components.get('green_api_client')
+        config_manager = components.get('config_manager')
         
-        if 'idMessage' in response and not response['idMessage'].startswith(('DISABLED', 'NON-SUMMARY')):
-            print("✅ Summary sent successfully!")
-            return True
-        else:
-            print(f"❌ Failed to send summary. Response: {response}")
+        if not green_api_client:
+            print("\n❌ Missing Green API client required for sending")
+            return False
+        
+        # FORCE DISABLE MESSAGE SENDING - SAFETY MEASURE
+        # This ensures messages are never sent accidentally during interactive mode
+        # For background mode (scheduled tasks), allow sending messages
+        message_sending_disabled = not background_mode
+        
+        # Previous settings checks (now just for information)
+        config_disabled = config_manager.get('BOT_MESSAGE_SENDING_DISABLED', 'false').lower() == 'true'
+        dry_run = config_manager.get('BOT_DRY_RUN', 'true').lower() == 'true'
+        
+        if message_sending_disabled:
+            print("\n⛔ Message sending is currently disabled for safety.")
+            print("To enable message sending in the future, contact the developer.")
+            return False
+        
+        # This code below will never execute due to the safety measure above
+        # But we keep it for reference in case sending is re-enabled in the future
+        if config_disabled:
+            print("\n⛔ Message sending is disabled in configuration.")
+            print("To enable, set BOT_MESSAGE_SENDING_DISABLED=false in .env")
+            return False
+        
+        if dry_run:
+            print(f"\n⚠️ DRY RUN MODE - The summary would be sent to group {group_id}")
+            print("To actually send messages, set BOT_DRY_RUN=false in .env")
+            return False
+        
+        try:
+            # Send the summary
+            print("\n⏳ Sending summary to group...")
+            response = green_api_client.send_message(group_id, summary, is_summary=True)
+            
+            if 'idMessage' in response and not response['idMessage'].startswith(('DISABLED', 'NON-SUMMARY')):
+                print("✅ Summary sent successfully!")
+                return True
+            else:
+                print(f"❌ Failed to send summary. Response: {response}")
+                return False
+            
+        except Exception as e:
+            logger.error(f"Error sending summary: {str(e)}")
+            display_error_and_continue(f"Error sending summary: {str(e)}")
             return False
             
     except Exception as e:
@@ -1310,7 +1368,7 @@ def load_user_settings():
     except Exception as e:
         logger.error(f"Error loading user settings: {str(e)}")
 
-def auto_fetch_new_messages(components, group_id=None):
+def auto_fetch_new_messages(components, group_id=None, background_mode=False):
     """Automatic fetching of new messages when starting the bot"""
     print("\n⏳ Automatically fetching new messages...")
     
@@ -1336,13 +1394,23 @@ def auto_fetch_new_messages(components, group_id=None):
                     groups = group_manager.get_groups()
                     if groups and len(groups) > 0:
                         group_id = groups[0]['id']
-                        print(f"⚠️ No group specified, using first group: {groups[0]['name']}")
+                        print(f"⚠️ No group specified, using first group: {groups[0]['name']} ({group_id})")
             except Exception as e:
-                print(f"❌ Error getting group list: {str(e)}")
+                error_msg = f"Error getting group list: {str(e)}"
+                if background_mode:
+                    print(f"⚠️ {error_msg} - continuing with limited functionality")
+                    logging.getLogger(__name__).error(error_msg)
+                else:
+                    print(f"❌ {error_msg}")
                 return False
         
         if not group_id:
-            print("❌ No group found for fetching messages")
+            error_msg = "No group found for fetching messages"
+            if background_mode:
+                print(f"⚠️ {error_msg} - skipping message fetch")
+                logging.getLogger(__name__).error(error_msg)
+            else:
+                print(f"❌ {error_msg}")
             return False
             
         print(f"📱 Fetching new messages from group: {group_id}")
@@ -1351,20 +1419,38 @@ def auto_fetch_new_messages(components, group_id=None):
         messages = green_api_client.get_chat_history(group_id, count=800, min_count=500)
         
         if not messages:
-            print("❌ No new messages received")
+            error_msg = "No new messages received"
+            if background_mode:
+                print(f"⚠️ {error_msg} - continuing with existing database messages")
+                logging.getLogger(__name__).warning(error_msg)
+            else:
+                print(f"❌ {error_msg}")
             return False
             
         print(f"✅ Received {len(messages)} new messages")
         
         # Storing messages in the database
         print("\n⏳ Storing messages in the database...")
-        stored_count = supabase_client.store_messages(messages, group_id)
-        print(f"✅ Stored {stored_count} new messages in the database")
+        try:
+            stored_count = supabase_client.store_messages(messages, group_id)
+            print(f"✅ Stored {stored_count} new messages in the database")
+        except Exception as db_error:
+            error_msg = f"Error storing messages: {str(db_error)}"
+            if background_mode:
+                print(f"⚠️ {error_msg} - continuing with message processing")
+                logging.getLogger(__name__).error(error_msg)
+            else:
+                print(f"❌ {error_msg}")
         
         return True
         
     except Exception as e:
-        print(f"❌ Error in automatic message fetching: {str(e)}")
+        error_msg = f"Error in automatic message fetching: {str(e)}"
+        if background_mode:
+            print(f"⚠️ {error_msg} - attempting to continue")
+            logging.getLogger(__name__).error(error_msg)
+        else:
+            print(f"❌ {error_msg}")
         return False
 
 def background_menu(components):

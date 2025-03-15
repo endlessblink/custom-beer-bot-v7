@@ -44,95 +44,207 @@ class OpenAIClient:
         self.logger.info(f"OpenAI client initialized with model {model}")
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-    def generate_summary(self, 
-                         messages: List[Dict[str, Any]],
-                         target_language: str = 'hebrew') -> str:
-        """
-        Generate a summary of WhatsApp messages
-        
-        Args:
-            messages (List[Dict[str, Any]]): List of messages
-            target_language (str, optional): Target language for the summary. Defaults to 'hebrew'.
-            
-        Returns:
-            str: Summary text
-        """
-        if not messages:
-            logging.warning("No messages provided for summary generation")
-            return "No messages to summarize"
-            
-        logging.info(f"Generating summary for {len(messages)} messages")
-        
-        # Add cache-busting timestamp to ensure we get a fresh summary every time
-        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
-        cache_busting_id = os.urandom(4).hex()
-        logging.info(f"Adding cache-busting timestamp: {current_time} and ID: {cache_busting_id}")
-        
-        # Diagnostic logging
-        message_types = {}
-        for msg in messages:
-            msg_type = msg.get('typeMessage', 'unknown')
-            message_types[msg_type] = message_types.get(msg_type, 0) + 1
-        
-        logging.info(f"Message types in input: {message_types}")
-        
-        # Format messages for the prompt
-        formatted_messages = self._format_messages_for_summary(messages)
-        
-        # Calculate token count (rough estimation)
-        token_count = len(formatted_messages) // 4  # Very rough approximation
-        logging.info(f"Estimated token count for messages: {token_count}")
-        
-        # Check if we have a reasonable amount of content
-        if len(formatted_messages) < 100:  # This is an arbitrary threshold
-            logging.warning(f"Very little content for summary: only {len(formatted_messages)} characters")
-            if len(messages) >= 20:  # If we have messages but little formatted content
-                logging.warning("Many messages but little formatted content. This might indicate filtering or formatting issues.")
-        
-        # Create prompt based on target language
-        prompt = self._create_summary_prompt(formatted_messages, target_language)
-        
-        # Add the cache-busting info as a hidden instruction to the prompt
-        # This will be invisible in the output but ensures a unique request each time
-        anti_cache_instruction = f"\n\n[INTERNAL NOTE: Request Time: {current_time}, ID: {cache_busting_id}. This is a new, fresh summary request. Ignore this timestamp in your summary.]"
-        prompt += anti_cache_instruction
-        
-        # Call OpenAI API and get the summary
+    def generate_summary(self, messages, target_language='hebrew', custom_instructions=None, progress_callback=None):
+        """Generate a summary of the messages"""
         try:
-            # Check for extremely low token count which might indicate a problem
-            if token_count < 50 and len(messages) > 10:
-                logging.warning("Very low token count despite having messages. This might indicate a formatting problem.")
-                # Add a diagnostic message to the prompt
-                prompt += f"\n\nWARNING: The input seems unusually small for {len(messages)} messages. Please extract ANY meaningful information that can be found."
+            # Process messages in batches to show progress
+            processed_messages = []
+            total_messages = len(messages)
             
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are a helpful assistant that generates concise and accurate summaries of WhatsApp group conversations."},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=self.max_tokens,
-                temperature=0.7
-            )
+            print("\nProcessing messages for summary:")
+            print("[" + "-" * 50 + "]")
+            progress = 0
             
-            summary = response.choices[0].message.content.strip()
+            self.logger.info(f"Processing {total_messages} messages for summary")
+            processing_start_time = datetime.now()
             
-            # Post-processing checks
-            if "לא דווח" in summary and summary.count("לא דווח") > 5:
-                # If many "not reported" instances, log a warning
-                logging.warning("Summary contains many 'not reported' entries, which might indicate a problem with content extraction")
+            for i, msg in enumerate(messages):
+                # Process message
+                processed_msg = self._process_message_for_summary(msg)
+                if processed_msg:
+                    processed_messages.append(processed_msg)
+                
+                # Update progress bar
+                new_progress = int((i + 1) / total_messages * 50)
+                if new_progress > progress:
+                    progress = new_progress
+                    print("\r[" + "=" * progress + "-" * (50 - progress) + f"] {int((i + 1) / total_messages * 100)}%", end="", flush=True)
+                    
+                    # Log progress every 10%
+                    if (i + 1) % max(1, int(total_messages / 10)) == 0:
+                        self.logger.info(f"Processed {i+1}/{total_messages} messages ({int((i+1)/total_messages*100)}%)")
+                
+                # Call progress callback if provided
+                if progress_callback:
+                    progress_callback(i + 1, total_messages)
             
-            if len(summary) < 100:
-                logging.warning(f"Generated summary is very short ({len(summary)} chars), which might indicate a problem")
+            processing_end_time = datetime.now()
+            processing_duration = (processing_end_time - processing_start_time).total_seconds()
+            self.logger.info(f"Message processing completed in {processing_duration:.2f} seconds")
             
-            # Remove empty sections from the summary
-            summary = self._remove_empty_sections(summary)
+            print("\n")  # New line after progress bar
+            print("🔄 Creating summary with OpenAI API - this might take a minute...")
             
-            return summary
+            # Create the summary prompt
+            prompt = self._create_summary_prompt(processed_messages, target_language, custom_instructions)
+            
+            # Generate the summary with timeout
+            api_start_time = datetime.now()
+            self.logger.info("Calling OpenAI API to generate summary")
+            
+            try:
+                # Add timeout to API call (120 seconds)
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=self.max_tokens,
+                    temperature=0.7,
+                    timeout=120  # 2 minute timeout
+                )
+                
+                api_end_time = datetime.now()
+                api_duration = (api_end_time - api_start_time).total_seconds()
+                self.logger.info(f"OpenAI API call completed in {api_duration:.2f} seconds")
+                
+                return response.choices[0].message.content.strip()
+                
+            except Exception as api_error:
+                api_duration = (datetime.now() - api_start_time).total_seconds()
+                self.logger.error(f"OpenAI API call failed after {api_duration:.2f} seconds: {str(api_error)}")
+                
+                # If API call fails after a long time, it might be too many tokens
+                if api_duration > 30:  # If it took more than 30 seconds before failing
+                    self.logger.warning("API call took too long before failing, trying with reduced content")
+                    
+                    # Reduce number of messages to 50% if there are too many
+                    if len(processed_messages) > 100:
+                        reduced_messages = processed_messages[len(processed_messages)//2:]
+                        reduced_prompt = self._create_summary_prompt(reduced_messages, target_language, custom_instructions)
+                        
+                        print("⚠️ Using reduced message set (50%) for summary due to potential token limit")
+                        self.logger.info(f"Retrying with {len(reduced_messages)} messages (50% of original)")
+                        
+                        # Try with reduced set
+                        response = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=[{"role": "user", "content": reduced_prompt}],
+                            max_tokens=self.max_tokens,
+                            temperature=0.7,
+                            timeout=120
+                        )
+                        
+                        return response.choices[0].message.content.strip()
+                
+                # Re-raise the exception if fallback also fails
+                raise
             
         except Exception as e:
-            logging.error(f"Error generating summary: {str(e)}")
-            return f"Error generating summary: {str(e)}"
+            self.logger.error(f"Error generating summary: {str(e)}")
+            raise
+
+    def _process_message_for_summary(self, msg):
+        """
+        Process a single message for summary generation
+        
+        Args:
+            msg (dict): Message dictionary containing message data
+            
+        Returns:
+            str: Processed message text or None if message should be skipped
+        """
+        try:
+            # Extract message data
+            timestamp = msg.get('timestamp')
+            
+            # Handle different timestamp formats
+            time_str = "Unknown time"
+            if timestamp is not None:
+                try:
+                    if isinstance(timestamp, int):
+                        time_str = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+                    elif isinstance(timestamp, str):
+                        # Try to convert string to int first
+                        try:
+                            time_str = datetime.fromtimestamp(int(timestamp)).strftime('%Y-%m-%d %H:%M:%S')
+                        except ValueError:
+                            # If that fails, just use the string as is
+                            time_str = timestamp
+                    elif isinstance(timestamp, datetime):
+                        # If it's already a datetime object
+                        time_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+                except Exception as time_error:
+                    self.logger.error(f"Error formatting timestamp {timestamp} (type: {type(timestamp)}): {str(time_error)}")
+                    time_str = f"Time error ({type(timestamp).__name__})"
+            
+            sender = msg.get('senderName', 'Unknown')
+            
+            # Handle different message types
+            msg_type = msg.get('typeMessage')
+            
+            if msg_type == 'textMessage':
+                text = msg.get('textMessage', '')
+                if text:
+                    return f"[{time_str}] {sender}: {text}"
+                return None
+            
+            elif msg_type == 'imageMessage':
+                caption = msg.get('caption', '(image)')
+                return f"[{time_str}] {sender}: [IMAGE] {caption}"
+            
+            elif msg_type == 'videoMessage':
+                caption = msg.get('caption', '(video)')
+                return f"[{time_str}] {sender}: [VIDEO] {caption}"
+            
+            elif msg_type == 'documentMessage':
+                filename = msg.get('fileName', '(document)')
+                return f"[{time_str}] {sender}: [DOCUMENT] {filename}"
+            
+            elif msg_type == 'audioMessage':
+                return f"[{time_str}] {sender}: [AUDIO MESSAGE]"
+            
+            elif msg_type == 'locationMessage':
+                latitude = msg.get('latitude', 'unknown')
+                longitude = msg.get('longitude', 'unknown')
+                return f"[{time_str}] {sender}: [LOCATION] Lat: {latitude}, Lon: {longitude}"
+            
+            elif msg_type == 'contactMessage':
+                display_name = msg.get('displayName', '(contact)')
+                return f"[{time_str}] {sender}: [CONTACT] {display_name}"
+            
+            elif msg_type == 'extendedTextMessage':
+                # Try to extract text from extended message
+                text = msg.get('extendedTextMessage', {}).get('text', '')
+                if not text and 'textMessage' in msg:
+                    text = msg.get('textMessage', '')
+                
+                # Check for quoted message
+                quoted_msg = msg.get('quotedMessage', {})
+                quoted_text = quoted_msg.get('textMessage', '') if quoted_msg else ''
+                
+                if quoted_text:
+                    return f"[{time_str}] {sender} replying to '{quoted_text[:30]}...': {text}"
+                else:
+                    return f"[{time_str}] {sender}: {text}"
+            
+            else:
+                # For unknown message types, try to extract any available content
+                # Look for common text fields
+                text = ''
+                for field in ['textMessage', 'text', 'caption', 'message', 'content']:
+                    if field in msg and msg[field]:
+                        text = msg[field]
+                        break
+                
+                if text:
+                    return f"[{time_str}] {sender}: {text}"
+                else:
+                    # If no text field found, include a placeholder with message type
+                    return f"[{time_str}] {sender}: [MESSAGE TYPE: {msg_type or 'UNKNOWN'}]"
+        
+        except Exception as e:
+            self.logger.error(f"Error processing message for summary: {str(e)}")
+            self.logger.debug(f"Problematic message: {msg}")
+            return None
 
     def _format_messages_for_summary(self, messages: List[Dict[str, Any]]) -> str:
         """
@@ -391,13 +503,14 @@ class OpenAIClient:
         return "\n".join(formatted)
     
     def _create_summary_prompt(self, formatted_messages: str, 
-                              target_language: str) -> str:
+                              target_language: str, custom_instructions: str = None) -> str:
         """
         Create a prompt for summary generation
         
         Args:
             formatted_messages (str): Formatted messages
             target_language (str): Target language for summary
+            custom_instructions (str, optional): Custom instructions for the summary
             
         Returns:
             str: Summary prompt
