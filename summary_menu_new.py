@@ -18,6 +18,10 @@ from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import json
 import time
+import random
+import threading
+import schedule
+import signal
 
 from config.config_manager import ConfigManager
 from green_api.client import GreenAPIClient
@@ -38,6 +42,161 @@ from utils.menu.core_menu import (
 
 # Setup logging
 logger = setup_logger("INFO")
+
+class BackgroundBot:
+    """
+    Background mode for the WhatsApp Summary Bot
+    Allows the bot to run as a daemon and perform scheduled tasks
+    """
+    
+    def __init__(self):
+        self.components = None
+        self.running = False
+        self.scheduler_thread = None
+        self.logger = logging.getLogger(__name__)
+        self.scheduled_time = None
+        self.test_group_id = None
+        self.source_group_id = None  # Source group for fetching messages
+        self.target_group_id = None  # Target group for posting summaries
+    
+    def initialize(self):
+        """Initialize components for background operation"""
+        print("⏳ Initializing bot components for background operation...")
+        try:
+            self.components = initialize_components()
+            # Load user settings
+            load_user_settings()
+            
+            # Get group configurations
+            self.source_group_id = os.environ.get('SOURCE_GROUP_ID', os.environ.get('PREFERRED_GROUP_ID'))
+            self.target_group_id = os.environ.get('TARGET_GROUP_ID')
+            self.test_group_id = os.environ.get('TEST_GROUP_ID')
+            
+            # Get scheduled time if configured
+            self.scheduled_time = os.environ.get('SCHEDULED_POST_TIME')
+            return True
+        except Exception as e:
+            print(f"❌ Error initializing components: {str(e)}")
+            self.logger.error(f"Error initializing components: {str(e)}")
+            return False
+    
+    def setup_scheduler(self):
+        """Setup scheduled tasks"""
+        # Clear any existing jobs
+        schedule.clear()
+        
+        # If scheduled time is set, create a daily job
+        if self.scheduled_time:
+            try:
+                # Parse time in format HH:MM
+                hour, minute = self.scheduled_time.split(':')
+                hour, minute = int(hour), int(minute)
+                
+                # Schedule daily summary generation
+                schedule.every().day.at(f"{hour:02d}:{minute:02d}").do(self.generate_daily_summary)
+                print(f"✅ Scheduled daily summary generation at {hour:02d}:{minute:02d}")
+                self.logger.info(f"Scheduled daily summary generation at {hour:02d}:{minute:02d}")
+            except Exception as e:
+                print(f"❌ Error setting up scheduler: {str(e)}")
+                self.logger.error(f"Error setting up scheduler: {str(e)}")
+    
+    def scheduler_loop(self):
+        """Run the scheduler loop"""
+        while self.running:
+            schedule.run_pending()
+            time.sleep(30)  # Check every 30 seconds
+    
+    def generate_daily_summary(self):
+        """Generate and send daily summary"""
+        try:
+            self.logger.info("Starting scheduled daily summary generation")
+            print("\n⏳ Generating scheduled daily summary...")
+            
+            # Get the source group ID (where to fetch messages from)
+            source_group_id = self.source_group_id
+            if not source_group_id:
+                self.logger.error("No source group configured for fetching messages")
+                print("❌ No source group configured for fetching messages")
+                return
+            
+            # Determine where to send the summary
+            # Priority: 1. Test group (if exists), 2. Target group (if exists), 3. Source group
+            if self.test_group_id:
+                target_group_id = self.test_group_id
+                target_type = "test"
+            elif self.target_group_id:
+                target_group_id = self.target_group_id
+                target_type = "target"
+            else:
+                target_group_id = source_group_id
+                target_type = "source"
+            
+            # First, fetch new messages from the source group
+            print(f"⏳ Fetching new messages from the source group ({source_group_id})...")
+            auto_fetch_new_messages(self.components, group_id=source_group_id)
+            
+            # Generate summary for the last 24 hours from the source group
+            days = 1
+            debug_mode = False
+            summary = generate_summary(self.components, source_group_id, days, debug_mode)
+            
+            if summary:
+                print("\n✅ Summary generated successfully!")
+                
+                # Send to the appropriate target group
+                print(f"⏳ Sending summary to {target_type} group ({target_group_id})...")
+                send_summary(self.components, target_group_id, summary)
+                print("✅ Summary sent successfully!")
+                
+                self.logger.info(f"Scheduled summary sent: Source={source_group_id}, Target={target_group_id}")
+            else:
+                print("❌ Failed to generate summary")
+                self.logger.error("Failed to generate scheduled summary")
+        
+        except Exception as e:
+            print(f"❌ Error in scheduled summary generation: {str(e)}")
+            self.logger.error(f"Error in scheduled summary generation: {str(e)}")
+    
+    def start(self):
+        """Start the background bot"""
+        if self.running:
+            print("⚠️ Bot is already running")
+            return
+        
+        if not self.components and not self.initialize():
+            print("❌ Failed to initialize bot components")
+            return
+        
+        print("🤖 Starting bot in background mode...")
+        self.running = True
+        
+        # Setup scheduler
+        self.setup_scheduler()
+        
+        # Start scheduler thread
+        self.scheduler_thread = threading.Thread(target=self.scheduler_loop)
+        self.scheduler_thread.daemon = True
+        self.scheduler_thread.start()
+        
+        print("✅ Bot is now running in the background")
+        print(f"📅 {'Scheduled to post daily at ' + self.scheduled_time if self.scheduled_time else 'No scheduled posting configured'}")
+        print(f"🧪 {'Using test group for summaries' if self.test_group_id else 'Using real group for summaries'}")
+        print("\nPress Ctrl+C to stop the bot")
+        
+        # Keep the main thread alive until interrupted
+        try:
+            while self.running:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.stop()
+    
+    def stop(self):
+        """Stop the background bot"""
+        print("\n⏹️ Stopping background bot...")
+        self.running = False
+        if self.scheduler_thread:
+            self.scheduler_thread.join(timeout=2)
+        print("✅ Bot stopped")
 
 def initialize_components():
     """Initialize all necessary components"""
@@ -194,6 +353,17 @@ def generate_summary(components, group_id, days=1, debug=False):
         if not green_api_client or not openai_client or not message_processor:
             display_error_and_continue("Missing required components for summary generation")
             return None
+        
+        # Fetch and store the latest messages from the group first
+        if supabase_client:
+            print("\n📱 Fetching the latest messages to ensure fresh data...")
+            fetch_messages = green_api_client.get_chat_history(group_id, count=800, min_count=500)
+            if fetch_messages:
+                print(f"✅ Retrieved {len(fetch_messages)} messages")
+                stored_count = supabase_client.store_messages(fetch_messages, group_id)
+                print(f"✅ Stored {stored_count} new messages in the database")
+            else:
+                print("⚠️ Could not fetch new messages, proceeding with existing data")
         
         # Set higher request limits to ensure we get enough data
         message_request_count = 800  # Increased from 500
@@ -486,6 +656,66 @@ def generate_summary(components, group_id, days=1, debug=False):
         # Generate the summary
         print(f"\n⏳ Generating summary with OpenAI from {len(processed_messages)} messages...")
         
+        # סינון הודעות לפי טווח התאריכים שנבחר
+        filtered_messages = []
+        
+        # חישוב התאריך המינימלי על פי הפרמטר days
+        now = datetime.now()
+        min_date = now - timedelta(days=days)
+        print(f"\n📅 Filtering messages from the last {days} days (since {min_date.strftime('%Y-%m-%d')})")
+        
+        # מעבר על ההודעות וסינון לפי תאריך
+        filtered_count = 0
+        for msg in processed_messages:
+            msg_timestamp = None
+            
+            # ניסיון לחלץ את התאריך בפורמטים שונים
+            if 'timestamp' in msg:
+                timestamp = msg['timestamp']
+                try:
+                    if isinstance(timestamp, str):
+                        if timestamp.isdigit():
+                            # Unix timestamp as string
+                            msg_timestamp = datetime.fromtimestamp(int(timestamp))
+                        else:
+                            # ISO format string
+                            try:
+                                msg_timestamp = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            except ValueError:
+                                try:
+                                    # Try with other common formats
+                                    msg_timestamp = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
+                                except ValueError:
+                                    pass
+                    elif isinstance(timestamp, int) or isinstance(timestamp, float):
+                        # Unix timestamp as int/float
+                        msg_timestamp = datetime.fromtimestamp(timestamp)
+                    
+                    # בדיקה אם התאריך בטווח המבוקש
+                    if msg_timestamp and msg_timestamp >= min_date:
+                        filtered_messages.append(msg)
+                        filtered_count += 1
+                except Exception as e:
+                    # אם יש בעיה בפירוש התאריך, נכלול את ההודעה כברירת מחדל
+                    if debug:
+                        print(f"Error parsing timestamp {timestamp}: {str(e)}")
+                    filtered_messages.append(msg)
+            else:
+                # אם אין חותמת זמן, נכלול את ההודעה כברירת מחדל
+                filtered_messages.append(msg)
+        
+        print(f"✅ Filtered {filtered_count} messages from the last {days} days (out of {len(processed_messages)} total)")
+        
+        # אם אין מספיק הודעות, נציג אזהרה ונשתמש בכל ההודעות
+        min_expected = 50
+        if len(filtered_messages) < min_expected:
+            print(f"⚠️ Warning: Only {len(filtered_messages)} messages found in the specified time range.")
+            if confirm_action(f"Continue with only {len(filtered_messages)} messages? (No to use all {len(processed_messages)} messages)"):
+                print(f"Using {len(filtered_messages)} messages from the specified time range.")
+            else:
+                print(f"Using all {len(processed_messages)} messages regardless of date.")
+                filtered_messages = processed_messages
+        
         # Add a cache-busting timestamp to ensure we get a fresh summary
         cache_buster = datetime.now().strftime('%Y%m%d%H%M%S')
         
@@ -507,13 +737,13 @@ def generate_summary(components, group_id, days=1, debug=False):
             try:
                 # Add cache buster to the custom prompt
                 custom_prompt += f"\n\nTimestamp: {cache_buster}"
-                summary = openai_client.generate_summary(processed_messages, target_language='hebrew')
+                summary = openai_client.generate_summary(filtered_messages, custom_instructions=custom_instructions, target_language='hebrew')
                 print(f"\n✅ Summary generated with custom prompt")
             except Exception as e:
                 print(f"\n❌ Error generating summary with custom prompt: {str(e)}")
                 if confirm_action("Try with default prompt instead?"):
                     print("\n⏳ Generating summary with default prompt...")
-                    summary = openai_client.generate_summary(processed_messages, target_language='hebrew')
+                    summary = openai_client.generate_summary(filtered_messages, target_language='hebrew')
                 else:
                     display_error_and_continue(f"Failed to generate summary: {str(e)}")
                     return None
@@ -522,7 +752,7 @@ def generate_summary(components, group_id, days=1, debug=False):
                 # Always force a new summary by using cache busting timestamp
                 print("\n⏳ Generating fresh summary... הסיכום יהיה עדכני למועד הנוכחי")
                 # Use the timestamp parameter for cache busting
-                summary = openai_client.generate_summary(processed_messages, target_language='hebrew')
+                summary = openai_client.generate_summary(filtered_messages, target_language='hebrew')
                 print(f"\n✅ Summary generated successfully")
                 
                 # Check summary quality by looking for too many "not reported" entries
@@ -548,9 +778,9 @@ def generate_summary(components, group_id, days=1, debug=False):
                 if "maximum context length" in error_msg.lower():
                     print("\nThe input might be too large for the model. Trying with fewer messages...")
                     # Try with half the messages
-                    half_count = len(processed_messages) // 2
+                    half_count = len(filtered_messages) // 2
                     try:
-                        reduced_messages = processed_messages[:half_count]
+                        reduced_messages = filtered_messages[:half_count]
                         print(f"\n⏳ Retrying with {half_count} messages...")
                         summary = openai_client.generate_summary(reduced_messages, target_language='hebrew')
                         print(f"\n✅ Summary generated successfully with reduced message count")
@@ -565,15 +795,52 @@ def generate_summary(components, group_id, days=1, debug=False):
         # Store the summary in the database if available
         if supabase_client:
             try:
-                end_time = datetime.now()
-                start_time = end_time - timedelta(days=days)
+                if filtered_messages and len(filtered_messages) > 0:
+                    # חישוב תאריכי התחלה וסיום לסיכום בהתבסס על ההודעות המסוננות
+                    timestamps = []
+                    for msg in filtered_messages:
+                        if 'timestamp' in msg and msg['timestamp']:
+                            try:
+                                # נסה לפענח את החותמת בדרכים שונות
+                                ts = msg['timestamp']
+                                if isinstance(ts, str):
+                                    if ts.isdigit():
+                                        timestamps.append(int(ts))
+                                    elif 'T' in ts:  # ISO format
+                                        dt = datetime.fromisoformat(ts.replace('Z', '+00:00'))
+                                        timestamps.append(dt.timestamp())
+                                elif isinstance(ts, (int, float)):
+                                    timestamps.append(ts)
+                            except:
+                                pass
+                    
+                    # חישוב התאריכים על סמך חותמות הזמן
+                    start_time = datetime.fromtimestamp(min(timestamps)) if timestamps else now - timedelta(days=days)
+                    end_time = datetime.fromtimestamp(max(timestamps)) if timestamps else now
+                    
+                    print(f"\n📅 Summary covers from {start_time.strftime('%Y-%m-%d %H:%M')} to {end_time.strftime('%Y-%m-%d %H:%M')}")
+                else:
+                    # אם אין הודעות מסוננות, השתמש בחישוב פשוט
+                    end_time = datetime.now()
+                    start_time = end_time - timedelta(days=days)
+                    print(f"\n📅 Summary covers approximately {days} days (no message timestamps available)")
                 
-                supabase_client.store_summary(
+                # עיבוד רשימת המשתתפים
+                participants = []
+                participants_set = set()
+                for msg in filtered_messages:
+                    sender = msg.get('senderName')
+                    if sender and sender != 'Unknown' and sender not in participants_set:
+                        participants_set.add(sender)
+                        participants.append(sender)
+                
+                # שמירת הסיכום במסד הנתונים
+                stored_summary = supabase_client.store_summary(
                     summary=summary,
                     group_id=group_id,
                     start_time=start_time,
                     end_time=end_time,
-                    message_count=len(processed_messages),
+                    message_count=len(filtered_messages),
                     model_used=openai_client.model
                 )
                 print("\n✅ Stored summary in database")
@@ -1043,18 +1310,313 @@ def load_user_settings():
     except Exception as e:
         logger.error(f"Error loading user settings: {str(e)}")
 
+def auto_fetch_new_messages(components, group_id=None):
+    """Automatic fetching of new messages when starting the bot"""
+    print("\n⏳ Automatically fetching new messages...")
+    
+    try:
+        green_api_client = components.get('green_api_client')
+        supabase_client = components.get('supabase_client')
+        config_manager = components.get('config_manager')
+        
+        if not green_api_client or not supabase_client:
+            print("❌ Missing required components for fetching messages")
+            return False
+        
+        # Use specified group_id if provided, otherwise check for preferred/source group
+        if not group_id:
+            # Check if there is a preferred or source group defined
+            group_id = os.environ.get('SOURCE_GROUP_ID', os.environ.get('PREFERRED_GROUP_ID'))
+        
+        if not group_id:
+            # If no group specified, try to get the first group from the list
+            try:
+                group_manager = components.get('group_manager')
+                if group_manager:
+                    groups = group_manager.get_groups()
+                    if groups and len(groups) > 0:
+                        group_id = groups[0]['id']
+                        print(f"⚠️ No group specified, using first group: {groups[0]['name']}")
+            except Exception as e:
+                print(f"❌ Error getting group list: {str(e)}")
+                return False
+        
+        if not group_id:
+            print("❌ No group found for fetching messages")
+            return False
+            
+        print(f"📱 Fetching new messages from group: {group_id}")
+        
+        # Fetching new messages
+        messages = green_api_client.get_chat_history(group_id, count=800, min_count=500)
+        
+        if not messages:
+            print("❌ No new messages received")
+            return False
+            
+        print(f"✅ Received {len(messages)} new messages")
+        
+        # Storing messages in the database
+        print("\n⏳ Storing messages in the database...")
+        stored_count = supabase_client.store_messages(messages, group_id)
+        print(f"✅ Stored {stored_count} new messages in the database")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error in automatic message fetching: {str(e)}")
+        return False
+
+def background_menu(components):
+    """Display the background mode menu and handle user interaction"""
+    print_header("Background Mode")
+    
+    background_options = [
+        {'key': '1', 'text': 'Start Bot in Background'},
+        {'key': '2', 'text': 'Set Scheduled Posting Time'},
+        {'key': '3', 'text': 'Set Source Group (for fetching messages)'},
+        {'key': '4', 'text': 'Set Target Group (for posting summaries)'},
+        {'key': '5', 'text': 'Set Test Group (for testing summaries)'},
+        {'key': '6', 'text': 'View Current Background Settings'},
+        {'key': '7', 'text': 'Back'}
+    ]
+    
+    choice = show_menu("Background Mode", background_options, components)
+    
+    if choice == '1':
+        # Start bot in background
+        print_header("Start Bot in Background")
+        print("\n⚠️ Running in background mode will keep the bot active and executing scheduled tasks.")
+        print("⚠️ The terminal window must remain open while the bot is running.")
+        
+        if confirm_action("Start the bot in background mode?"):
+            # Start the background bot
+            bot = BackgroundBot()
+            bot.start()
+            
+    elif choice == '2':
+        # Set scheduled posting time
+        print_header("Set Scheduled Posting Time")
+        print("\nEnter the time when the bot should automatically post summaries (24-hour format).")
+        print("Example: 08:00 for 8 AM, 18:30 for 6:30 PM")
+        print("Leave empty to disable scheduled posting.")
+        
+        time_input = input("\nScheduled time (HH:MM): ").strip()
+        
+        if not time_input:
+            # Disable scheduled posting
+            save_user_setting('SCHEDULED_POST_TIME', '')
+            print("\n✅ Scheduled posting disabled")
+        else:
+            # Validate time format
+            try:
+                hour, minute = time_input.split(':')
+                hour, minute = int(hour), int(minute)
+                
+                if hour < 0 or hour > 23 or minute < 0 or minute > 59:
+                    print("\n❌ Invalid time format. Hours must be 0-23, minutes must be 0-59.")
+                else:
+                    time_str = f"{hour:02d}:{minute:02d}"
+                    save_user_setting('SCHEDULED_POST_TIME', time_str)
+                    print(f"\n✅ Scheduled posting time set to {time_str}")
+            except ValueError:
+                print("\n❌ Invalid time format. Please use HH:MM format.")
+        
+        input("\nPress Enter to continue...")
+        
+    elif choice == '3':
+        # Set source group (for fetching messages)
+        print_header("Set Source Group")
+        print("\nSelect a group from which messages will be fetched for summary generation.")
+        
+        if 'group_manager' not in components:
+            display_error_and_continue("Group manager not available")
+            return
+        
+        group = select_group(components)
+        if group:
+            # Save source group ID to user settings
+            save_user_setting('SOURCE_GROUP_ID', group['id'])
+            print(f"\n✅ Source group set to: {group['name']}")
+            input("\nPress Enter to continue...")
+            
+    elif choice == '4':
+        # Set target group (for posting summaries)
+        print_header("Set Target Group")
+        print("\nSelect a group where summaries will be posted.")
+        print("Leave this unset to use the source group for posting.")
+        
+        if 'group_manager' not in components:
+            display_error_and_continue("Group manager not available")
+            return
+        
+        print("\nCurrent groups:")
+        groups = components['group_manager'].get_groups()
+        for i, group in enumerate(groups, 1):
+            print(f"{i}. {group['name']} ({group['id']})")
+        
+        print("\n0. Clear target group (use source group instead)")
+        print("C. Cancel")
+        
+        group_choice = input("\nSelect group: ").strip()
+        
+        if group_choice.lower() == 'c':
+            return
+        elif group_choice == '0':
+            save_user_setting('TARGET_GROUP_ID', '')
+            print("\n✅ Target group cleared. Source group will be used for posting.")
+        else:
+            try:
+                group_index = int(group_choice) - 1
+                if 0 <= group_index < len(groups):
+                    selected_group = groups[group_index]
+                    save_user_setting('TARGET_GROUP_ID', selected_group['id'])
+                    print(f"\n✅ Target group set to: {selected_group['name']}")
+                else:
+                    print("\n❌ Invalid selection.")
+            except ValueError:
+                print("\n❌ Invalid input. Please enter a number.")
+        
+        input("\nPress Enter to continue...")
+        
+    elif choice == '5':
+        # Set test group
+        print_header("Set Test Group")
+        print("\nSelect a group where test summaries will be sent during testing.")
+        print("This overrides both source and target groups for posting.")
+        print("Leave this unset to use the target/source group configuration.")
+        
+        if 'group_manager' not in components:
+            display_error_and_continue("Group manager not available")
+            return
+        
+        print("\nCurrent groups:")
+        groups = components['group_manager'].get_groups()
+        for i, group in enumerate(groups, 1):
+            print(f"{i}. {group['name']} ({group['id']})")
+        
+        print("\n0. Clear test group")
+        print("C. Cancel")
+        
+        group_choice = input("\nSelect group: ").strip()
+        
+        if group_choice.lower() == 'c':
+            return
+        elif group_choice == '0':
+            save_user_setting('TEST_GROUP_ID', '')
+            print("\n✅ Test group cleared.")
+        else:
+            try:
+                group_index = int(group_choice) - 1
+                if 0 <= group_index < len(groups):
+                    selected_group = groups[group_index]
+                    save_user_setting('TEST_GROUP_ID', selected_group['id'])
+                    print(f"\n✅ Test group set to: {selected_group['name']}")
+                else:
+                    print("\n❌ Invalid selection.")
+            except ValueError:
+                print("\n❌ Invalid input. Please enter a number.")
+        
+        input("\nPress Enter to continue...")
+        
+    elif choice == '6':
+        # View current background settings
+        print_header("Current Background Settings")
+        
+        # Load user settings
+        user_settings = {}
+        try:
+            if os.path.exists('user_settings.json'):
+                with open('user_settings.json', 'r') as f:
+                    user_settings = json.load(f)
+        except Exception as e:
+            print(f"❌ Error loading user settings: {str(e)}")
+        
+        # Display relevant settings
+        print("Background Mode Settings:")
+        
+        # Scheduled posting time
+        scheduled_time = user_settings.get('SCHEDULED_POST_TIME', os.environ.get('SCHEDULED_POST_TIME', 'Not set'))
+        print(f"  Scheduled Posting Time: {scheduled_time if scheduled_time else 'Disabled'}")
+        
+        # Get group manager for showing names
+        group_manager = components.get('group_manager')
+        groups = []
+        if group_manager:
+            try:
+                groups = group_manager.get_groups()
+            except Exception:
+                pass
+        
+        # Helper function to get group name from ID
+        def get_group_name(group_id):
+            if not group_id or group_id == 'Not set':
+                return 'Not set'
+            
+            for group in groups:
+                if group['id'] == group_id:
+                    return group['name']
+            return 'Unknown'
+        
+        # Source group
+        source_group_id = user_settings.get('SOURCE_GROUP_ID', os.environ.get('SOURCE_GROUP_ID', 
+                          user_settings.get('PREFERRED_GROUP_ID', os.environ.get('PREFERRED_GROUP_ID', 'Not set'))))
+        source_group_name = get_group_name(source_group_id)
+        print(f"  Source Group: {source_group_id} ({source_group_name})")
+        
+        # Target group
+        target_group_id = user_settings.get('TARGET_GROUP_ID', os.environ.get('TARGET_GROUP_ID', 'Not set'))
+        if target_group_id and target_group_id != 'Not set':
+            target_group_name = get_group_name(target_group_id)
+            print(f"  Target Group: {target_group_id} ({target_group_name})")
+        else:
+            print(f"  Target Group: Not set (using Source Group)")
+        
+        # Test group
+        test_group_id = user_settings.get('TEST_GROUP_ID', os.environ.get('TEST_GROUP_ID', 'Not set'))
+        if test_group_id and test_group_id != 'Not set':
+            test_group_name = get_group_name(test_group_id)
+            print(f"  Test Group: {test_group_id} ({test_group_name})")
+        else:
+            print(f"  Test Group: Not set")
+        
+        # Summary flow explanation
+        print("\nSummary Posting Flow:")
+        if test_group_id and test_group_id != 'Not set':
+            print(f"  Messages from: {source_group_name}")
+            print(f"  Summaries to: {get_group_name(test_group_id)} (Test Group)")
+        elif target_group_id and target_group_id != 'Not set':
+            print(f"  Messages from: {source_group_name}")
+            print(f"  Summaries to: {get_group_name(target_group_id)} (Target Group)")
+        else:
+            print(f"  Messages from: {source_group_name}")
+            print(f"  Summaries to: {source_group_name} (Source Group)")
+        
+        input("\nPress Enter to continue...")
+        
+    elif choice == '7':
+        # Back to main menu
+        return
+
 def run_main_menu():
     """Display the main menu and handle user interaction"""
     # Initialize components
     print("⏳ Initializing components...")
     components = initialize_components()
     
+    # Remove automatic message fetching on startup
+    print("\n===============================")
+    print("📋 Welcome to the main menu")
+    print("===============================\n")
+    
     # Define main menu options
     main_menu_options = [
         {'key': '1', 'text': 'Generate New Summary', 'requires': ['group_manager', 'openai_client']},
-        {'key': '2', 'text': 'Settings'},
-        {'key': '3', 'text': 'Debug Mode'},
-        {'key': '4', 'text': 'Exit'}
+        {'key': '2', 'text': 'Fetch New Messages', 'requires': ['green_api_client', 'supabase_client']},
+        {'key': '3', 'text': 'Background Mode', 'requires': ['green_api_client', 'supabase_client', 'openai_client']},
+        {'key': '4', 'text': 'Settings'},
+        {'key': '5', 'text': 'Debug Mode'},
+        {'key': '6', 'text': 'Exit'}
     ]
     
     while True:
@@ -1085,14 +1647,28 @@ def run_main_menu():
             input("\nPress Enter to continue...")
             
         elif choice == '2':
+            # Fetch New Messages
+            fetch_result = auto_fetch_new_messages(components)
+            if fetch_result:
+                print("\n✅ Messages fetched and stored successfully")
+            else:
+                print("\n⚠️ Failed to fetch messages or no new messages available")
+            
+            input("\nPress Enter to continue...")
+            
+        elif choice == '3':
+            # Background Mode
+            background_menu(components)
+            
+        elif choice == '4':
             # Settings
             settings_menu(components)
             
-        elif choice == '3':
+        elif choice == '5':
             # Debug Mode
             debug_menu(components)
             
-        elif choice == '4':
+        elif choice == '6':
             # Exit
             print("\nExiting...")
             return
@@ -1108,16 +1684,30 @@ if __name__ == "__main__":
     2. Run the program: python summary_menu_new.py
     3. Use the menu to generate summaries, view previous ones, or change settings
     
-    Note on database errors:
-    If you encounter Supabase database errors, the program will continue to function
-    with basic features, but without storing or retrieving previous summaries.
+    Background Mode:
+    - To run in background: python summary_menu_new.py --background
+    - The bot can be scheduled to post at specific times
     """
-    try:
-        run_main_menu()
-    except KeyboardInterrupt:
-        print("\n\nProgram terminated by user.")
-    except Exception as e:
-        logger.error(f"Unexpected error: {str(e)}")
-        print(f"\n\nAn unexpected error occurred: {str(e)}")
+    # Handle command line arguments
+    if len(sys.argv) > 1 and sys.argv[1] == '--background':
+        # Run in background mode
+        print("Starting bot in background mode...")
+        bot = BackgroundBot()
+        try:
+            bot.start()
+        except KeyboardInterrupt:
+            print("\n\nProgram terminated by user.")
+        except Exception as e:
+            logger.error(f"Unexpected error in background mode: {str(e)}")
+            print(f"\n\nAn unexpected error occurred: {str(e)}")
+    else:
+        # Run in interactive mode
+        try:
+            run_main_menu()
+        except KeyboardInterrupt:
+            print("\n\nProgram terminated by user.")
+        except Exception as e:
+            logger.error(f"Unexpected error: {str(e)}")
+            print(f"\n\nAn unexpected error occurred: {str(e)}")
         
     print("\nGoodbye!") 
