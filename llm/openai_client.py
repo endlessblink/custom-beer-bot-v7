@@ -13,6 +13,7 @@ from typing import Any, Dict, List, Optional
 import openai
 from tenacity import retry, stop_after_attempt, wait_exponential
 import os
+from datetime import datetime
 
 
 class OpenAIClient:
@@ -43,147 +44,289 @@ class OpenAIClient:
         self.logger.info(f"OpenAI client initialized with model {model}")
     
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=1, max=10))
-    def generate_summary(self, messages: List[Dict[str, Any]], 
-                         target_language: str = "hebrew") -> str:
+    def generate_summary(self, 
+                         messages: List[Dict[str, Any]],
+                         target_language: str = 'hebrew') -> str:
         """
-        Generate a summary of messages
+        Generate a summary of WhatsApp messages
         
         Args:
-            messages (List[Dict[str, Any]]): List of messages to summarize
-            target_language (str, optional): Language for the summary. Defaults to "hebrew".
+            messages (List[Dict[str, Any]]): List of messages
+            target_language (str, optional): Target language for the summary. Defaults to 'hebrew'.
             
         Returns:
-            str: Generated summary
-            
-        Raises:
-            Exception: If summary generation fails
+            str: Summary text
         """
-        self.logger.info(f"Generating summary for {len(messages)} messages")
-        
-        # Validate input
         if not messages:
-            error_msg = "Cannot generate summary: No messages provided"
-            self.logger.error(error_msg)
-            raise ValueError(error_msg)
-        
-        # Validate minimum message count for a meaningful summary
-        if len(messages) < 3:
-            self.logger.warning(f"Very few messages ({len(messages)}) provided for summarization")
+            logging.warning("No messages provided for summary generation")
+            return "No messages to summarize"
             
-            # Instead of failing, provide a warning in the logs but proceed
-            if len(messages) == 1:
-                self.logger.info("Only one message provided, proceeding with simple formatting")
-                # For a single message, just return it directly with a header
-                try:
-                    sender = messages[0].get('senderName', 'Unknown')
-                    text = messages[0].get('textMessage', '')
-                    if text:
-                        return f"### סיכום הודעה בודדת\n\n{sender}: {text}"
-                    else:
-                        error_msg = "The single message provided has no text content"
-                        self.logger.error(error_msg)
-                        raise ValueError(error_msg)
-                except Exception as e:
-                    error_msg = f"Error handling single message case: {str(e)}"
-                    self.logger.error(error_msg)
-                    raise ValueError(error_msg)
+        logging.info(f"Generating summary for {len(messages)} messages")
         
-        # Log the type of messages for debugging
-        try:
-            self.logger.debug(f"Sample message keys: {list(messages[0].keys())}")
-            self.logger.debug(f"Sample message sender: {messages[0].get('senderName', 'N/A')}")
-            self.logger.debug(f"Sample message text: {messages[0].get('textMessage', '')[:50]}...")
-        except (IndexError, KeyError, TypeError) as e:
-            self.logger.warning(f"Could not log sample message info: {str(e)}")
+        # Add cache-busting timestamp to ensure we get a fresh summary every time
+        current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')
+        cache_busting_id = os.urandom(4).hex()
+        logging.info(f"Adding cache-busting timestamp: {current_time} and ID: {cache_busting_id}")
         
-        # Prepare messages for the prompt
-        formatted_messages = self._format_messages(messages)
+        # Diagnostic logging
+        message_types = {}
+        for msg in messages:
+            msg_type = msg.get('typeMessage', 'unknown')
+            message_types[msg_type] = message_types.get(msg_type, 0) + 1
         
-        # Validate formatted messages
-        if not formatted_messages or formatted_messages.strip() == "":
-            error_msg = "Failed to format messages for summary"
-            self.logger.error(error_msg)
-            raise ValueError(error_msg)
+        logging.info(f"Message types in input: {message_types}")
         
-        # Check if the formatted messages exceed any token limits
-        token_estimate = len(formatted_messages) / 4  # Rough estimate: ~4 chars per token
-        if token_estimate > 32000:  # Conservative limit for GPT-4 input tokens
-            self.logger.warning(f"Input may exceed token limit ({int(token_estimate)} estimated tokens)")
-            # Truncate to approximately 30K tokens for safety
-            formatted_messages = formatted_messages[:120000]  # ~30K tokens
-            self.logger.info(f"Truncated input to {len(formatted_messages)} characters")
+        # Format messages for the prompt
+        formatted_messages = self._format_messages_for_summary(messages)
         
-        # Create the prompt
+        # Calculate token count (rough estimation)
+        token_count = len(formatted_messages) // 4  # Very rough approximation
+        logging.info(f"Estimated token count for messages: {token_count}")
+        
+        # Check if we have a reasonable amount of content
+        if len(formatted_messages) < 100:  # This is an arbitrary threshold
+            logging.warning(f"Very little content for summary: only {len(formatted_messages)} characters")
+            if len(messages) >= 20:  # If we have messages but little formatted content
+                logging.warning("Many messages but little formatted content. This might indicate filtering or formatting issues.")
+        
+        # Create prompt based on target language
         prompt = self._create_summary_prompt(formatted_messages, target_language)
         
+        # Add the cache-busting info as a hidden instruction to the prompt
+        # This will be invisible in the output but ensures a unique request each time
+        anti_cache_instruction = f"\n\n[INTERNAL NOTE: Request Time: {current_time}, ID: {cache_busting_id}. This is a new, fresh summary request. Ignore this timestamp in your summary.]"
+        prompt += anti_cache_instruction
+        
+        # Call OpenAI API and get the summary
         try:
-            # Call OpenAI API
-            self.logger.info(f"Calling OpenAI API with model {self.model}")
+            # Check for extremely low token count which might indicate a problem
+            if token_count < 50 and len(messages) > 10:
+                logging.warning("Very low token count despite having messages. This might indicate a formatting problem.")
+                # Add a diagnostic message to the prompt
+                prompt += f"\n\nWARNING: The input seems unusually small for {len(messages)} messages. Please extract ANY meaningful information that can be found."
+            
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "You are a helpful assistant that summarizes WhatsApp group conversations."},
+                    {"role": "system", "content": "You are a helpful assistant that generates concise and accurate summaries of WhatsApp group conversations."},
                     {"role": "user", "content": prompt}
                 ],
                 max_tokens=self.max_tokens,
                 temperature=0.7
             )
             
-            # Validate response
-            if not response or not hasattr(response, 'choices') or not response.choices:
-                error_msg = "OpenAI API returned an invalid response format"
-                self.logger.error(error_msg)
-                raise ValueError(error_msg)
-            
-            # Extract summary from response
             summary = response.choices[0].message.content.strip()
             
-            # Validate summary
-            if not summary:
-                error_msg = "OpenAI API returned an empty summary"
-                self.logger.error(error_msg)
-                raise ValueError(error_msg)
+            # Post-processing checks
+            if "לא דווח" in summary and summary.count("לא דווח") > 5:
+                # If many "not reported" instances, log a warning
+                logging.warning("Summary contains many 'not reported' entries, which might indicate a problem with content extraction")
             
-            self.logger.info("Summary generated successfully")
+            if len(summary) < 100:
+                logging.warning(f"Generated summary is very short ({len(summary)} chars), which might indicate a problem")
+            
             return summary
             
-        except openai.APIError as e:
-            error_msg = f"OpenAI API error: {str(e)}"
-            self.logger.error(error_msg)
-            # Add request details to help diagnose the issue
-            self.logger.error(f"Request details: model={self.model}, max_tokens={self.max_tokens}")
-            raise openai.APIError(f"{error_msg}. Please check your API key and OpenAI service status.")
-
-        except openai.RateLimitError as e:
-            error_msg = f"OpenAI rate limit exceeded: {str(e)}"
-            self.logger.error(error_msg)
-            raise openai.RateLimitError(f"{error_msg}. Please wait a few minutes before trying again.")
-
-        except openai.APIConnectionError as e:
-            error_msg = f"Failed to connect to OpenAI API: {str(e)}"
-            self.logger.error(error_msg)
-            raise openai.APIConnectionError(f"{error_msg}. Please check your internet connection.")
-
-        except openai.InvalidRequestError as e:
-            error_msg = f"Invalid request to OpenAI API: {str(e)}"
-            self.logger.error(error_msg)
-            # Log additional details about the request
-            self.logger.error(f"Request details: model={self.model}, prompt_length={len(prompt)}")
-            
-            # Check for common issues
-            if "maximum context length" in str(e).lower():
-                raise openai.InvalidRequestError(f"{error_msg}. The input is too long for the model. Try summarizing fewer messages.")
-            elif "rate limit" in str(e).lower():
-                raise openai.InvalidRequestError(f"{error_msg}. You may have hit a rate limit. Please wait and try again.")
-            else:
-                raise openai.InvalidRequestError(f"{error_msg}. Please check your request parameters.")
-
         except Exception as e:
-            error_msg = f"Unexpected error during summary generation: {str(e)}"
-            self.logger.error(error_msg)
-            # Log the exception type to help with debugging
-            self.logger.error(f"Exception type: {type(e).__name__}")
-            raise Exception(f"Failed to generate summary: {str(e)}. Please check the logs for more details.")
+            logging.error(f"Error generating summary: {str(e)}")
+            return f"Error generating summary: {str(e)}"
+
+    def _format_messages_for_summary(self, messages: List[Dict[str, Any]]) -> str:
+        """
+        Format messages for summary generation
+        
+        Args:
+            messages (List[Dict[str, Any]]): List of messages
+            
+        Returns:
+            str: Formatted messages string
+        """
+        formatted_messages = []
+        
+        logging.info(f"Formatting {len(messages)} messages for summary")
+        
+        # Sort messages by timestamp if available
+        try:
+            messages_with_timestamp = [
+                msg for msg in messages 
+                if 'timestamp' in msg and msg['timestamp'] is not None
+            ]
+            
+            if messages_with_timestamp:
+                # Handle different timestamp formats - ensure they're converted to integers
+                for msg in messages_with_timestamp:
+                    if isinstance(msg['timestamp'], str):
+                        try:
+                            # Try to convert string timestamp to integer
+                            msg['timestamp'] = int(msg['timestamp'])
+                            logging.info(f"Converted string timestamp '{msg['timestamp']}' to integer")
+                        except ValueError:
+                            # If conversion fails, log but keep the message
+                            logging.warning(f"Could not convert timestamp '{msg['timestamp']}' to integer, using as is")
+                
+                # Sort by timestamp, handling both integer and string timestamps
+                def get_timestamp_value(msg):
+                    ts = msg.get('timestamp')
+                    if isinstance(ts, int):
+                        return ts
+                    elif isinstance(ts, str):
+                        try:
+                            return int(ts)
+                        except ValueError:
+                            return 0  # Default value if conversion fails
+                    return 0
+                
+                messages_with_timestamp.sort(key=get_timestamp_value)
+                messages = messages_with_timestamp
+                logging.info(f"Sorted {len(messages_with_timestamp)} messages by timestamp")
+            else:
+                logging.warning("No messages with timestamp found for sorting")
+        except Exception as e:
+            logging.warning(f"Error sorting messages by timestamp: {str(e)}")
+            logging.warning(f"Timestamp example: {messages[0].get('timestamp') if messages else 'No messages'}")
+        
+        filtered_count = 0
+        error_count = 0
+        
+        for msg_index, msg in enumerate(messages):
+            try:
+                # Extract message data
+                timestamp = msg.get('timestamp')
+                
+                # Handle different timestamp formats
+                time_str = "Unknown time"
+                if timestamp is not None:
+                    try:
+                        if isinstance(timestamp, int):
+                            time_str = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+                        elif isinstance(timestamp, str):
+                            # Try to convert string to int first
+                            try:
+                                time_str = datetime.fromtimestamp(int(timestamp)).strftime('%Y-%m-%d %H:%M:%S')
+                            except ValueError:
+                                # If that fails, just use the string as is
+                                time_str = timestamp
+                        elif isinstance(timestamp, datetime):
+                            # If it's already a datetime object
+                            time_str = timestamp.strftime('%Y-%m-%d %H:%M:%S')
+                    except Exception as time_error:
+                        logging.error(f"Error formatting timestamp {timestamp} (type: {type(timestamp)}): {str(time_error)}")
+                        time_str = f"Time error ({type(timestamp).__name__})"
+                
+                sender = msg.get('senderName', 'Unknown')
+                
+                # Handle different message types
+                msg_type = msg.get('typeMessage')
+                
+                if msg_type == 'textMessage':
+                    text = msg.get('textMessage', '')
+                    if text:
+                        formatted_messages.append(f"[{time_str}] {sender}: {text}")
+                    else:
+                        filtered_count += 1
+                
+                elif msg_type == 'imageMessage':
+                    caption = msg.get('caption', '(image)')
+                    formatted_messages.append(f"[{time_str}] {sender}: [IMAGE] {caption}")
+                
+                elif msg_type == 'videoMessage':
+                    caption = msg.get('caption', '(video)')
+                    formatted_messages.append(f"[{time_str}] {sender}: [VIDEO] {caption}")
+                
+                elif msg_type == 'documentMessage':
+                    filename = msg.get('fileName', '(document)')
+                    formatted_messages.append(f"[{time_str}] {sender}: [DOCUMENT] {filename}")
+                
+                elif msg_type == 'audioMessage':
+                    formatted_messages.append(f"[{time_str}] {sender}: [AUDIO MESSAGE]")
+                
+                elif msg_type == 'locationMessage':
+                    latitude = msg.get('latitude', 'unknown')
+                    longitude = msg.get('longitude', 'unknown')
+                    formatted_messages.append(f"[{time_str}] {sender}: [LOCATION] Lat: {latitude}, Lon: {longitude}")
+                
+                elif msg_type == 'contactMessage':
+                    display_name = msg.get('displayName', '(contact)')
+                    formatted_messages.append(f"[{time_str}] {sender}: [CONTACT] {display_name}")
+                
+                elif msg_type == 'extendedTextMessage':
+                    # Try to extract text from extended message
+                    text = msg.get('extendedTextMessage', {}).get('text', '')
+                    if not text and 'textMessage' in msg:
+                        text = msg.get('textMessage', '')
+                    
+                    # Check for quoted message
+                    quoted_msg = msg.get('quotedMessage', {})
+                    quoted_text = quoted_msg.get('textMessage', '') if quoted_msg else ''
+                    
+                    if quoted_text:
+                        formatted_messages.append(f"[{time_str}] {sender} replying to '{quoted_text[:30]}...': {text}")
+                    else:
+                        formatted_messages.append(f"[{time_str}] {sender}: {text}")
+                
+                else:
+                    # For unknown message types, try to extract any available content
+                    # Look for common text fields
+                    text = ''
+                    for field in ['textMessage', 'text', 'caption', 'message', 'content']:
+                        if field in msg and msg[field]:
+                            text = msg[field]
+                            break
+                    
+                    if text:
+                        formatted_messages.append(f"[{time_str}] {sender}: {text}")
+                    else:
+                        # If no text field found, include a placeholder with message type
+                        formatted_messages.append(f"[{time_str}] {sender}: [MESSAGE TYPE: {msg_type or 'UNKNOWN'}]")
+                        logging.debug(f"Unknown message type: {msg_type}, keys: {list(msg.keys())}")
+            
+            except Exception as e:
+                error_count += 1
+                logging.error(f"Error formatting message {msg_index} for summary: {str(e)}")
+                logging.debug(f"Problematic message: {msg}")
+                # Try a simplified approach to salvage the message
+                try:
+                    sender = msg.get('senderName', 'Unknown')
+                    # Look for any text content
+                    text_content = ''
+                    for field in ['textMessage', 'text', 'caption', 'message', 'content']:
+                        if field in msg and msg[field]:
+                            text_content = msg[field]
+                            break
+                    
+                    if text_content:
+                        formatted_messages.append(f"[Error formatting time] {sender}: {text_content}")
+                        logging.info(f"Salvaged message with text: {text_content[:30]}...")
+                except Exception as rescue_error:
+                    logging.error(f"Could not salvage message: {str(rescue_error)}")
+                continue
+        
+        logging.info(f"Formatted {len(formatted_messages)} messages, filtered {filtered_count} messages, encountered {error_count} errors")
+        
+        formatted_text = "\n".join(formatted_messages)
+        
+        # Final check to ensure we have content
+        if not formatted_text:
+            logging.warning("NO FORMATTED MESSAGES GENERATED. Last resort attempt to extract any text:")
+            # Last resort attempt to extract any usable text
+            for msg in messages:
+                try:
+                    # Try to extract sender
+                    sender = msg.get('senderName', 'Unknown')
+                    
+                    # Try to find any text field
+                    for field in msg:
+                        if isinstance(msg[field], str) and len(msg[field]) > 2:
+                            formatted_messages.append(f"{sender}: {msg[field]}")
+                            logging.info(f"Added emergency text from field '{field}': {msg[field][:30]}...")
+                            break
+                except Exception as e:
+                    logging.error(f"Error in emergency text extraction: {str(e)}")
+            
+            formatted_text = "\n".join(formatted_messages)
+            logging.info(f"Emergency text extraction produced {len(formatted_messages)} lines")
+            
+        return formatted_text
     
     def _format_messages(self, messages: List[Dict[str, Any]]) -> str:
         """
@@ -299,13 +442,269 @@ class OpenAIClient:
 - אם חלק מהסעיפים ריקים, אפשר לדלג עליהם לחלוטין
 - השתמש בשפה רהוטה, ברורה וללא שגיאות
 """
-        
-        return f"""
+
+            # עדכון בשביל קבוצת Custom Beer Node - תבנית ספציפית יותר עם כותרות רלוונטיות
+            custom_beer_prompt = """
+## סיכום שיחות קבוצת Custom Beer Node
+### תאריך: [תאריך] | תקופה: [שעה מהודעה ראשונה] - [שעה מהודעה אחרונה]
+
+### 😂 בדיחת AI היום:
+[הוסף כאן בדיחה קצרה הקשורה לבינה מלאכותית]
+
+### 1. פרויקטים ופיתוחים שהוצגו
+- [פרויקט 1 + תיאור קצר] (מאת: [שם המציג])
+- [פרויקט 2 + תיאור קצר] (מאת: [שם המציג])
+- ...
+
+### 2. תוצרים ודמואים שהוצגו
+- [תוצר 1 + תיאור] (מאת: [שם המציג])
+- [תוצר 2 + תיאור] (מאת: [שם המציג])
+- ...
+
+### 3. כלים וטכנולוגיות חדשים שנדונו
+- [כלי/טכנולוגיה 1 + תיאור קצר]
+- [כלי/טכנולוגיה 2 + תיאור קצר]
+- ...
+
+### 4. בעיות טכניות ופתרונות שהוצעו
+- [בעיה 1]: [פתרון שהוצע]
+- [בעיה 2]: [פתרון שהוצע]
+- ...
+
+### 5. משאבים ומאמרים שהועברו
+- [קישור/מאמר 1]: [תיאור קצר] (שותף ע"י: [שם])
+- [קישור/מאמר 2]: [תיאור קצר] (שותף ע"י: [שם])
+- ...
+
+### 6. סטטוס פרויקטים מתמשכים
+- [פרויקט 1]: [סטטוס עדכני] (מאת: [שם])
+- [פרויקט 2]: [סטטוס עדכני] (מאת: [שם])
+- ...
+
+### 7. שאלות פתוחות ותחומי עניין לעתיד
+- [שאלה/נושא 1]
+- [שאלה/נושא 2]
+- ...
+
+### 8. חידושים בתחום בינה מלאכותית גנרטיבית
+- [חידוש 1 + תיאור קצר]
+- [חידוש 2 + תיאור קצר]
+- ...
+
+### 9. ווקפלואים (workflows) של ComfyUI שהועברו
+- [ווקפלו 1 + תיאור] (מאת: [שם])
+- [ווקפלו 2 + תיאור] (מאת: [שם])
+- ...
+
+### 10. מושגים טכניים חדשים שנדונו
+- [מושג 1]: [הסבר קצר]
+- [מושג 2]: [הסבר קצר]
+- ...
+"""
+
+            # החלף את התבנית הכללית בתבנית המותאמת לקבוצה
+            prompt_template = custom_beer_prompt
+
+        # הנחיות מיוחדות לסיכום כדי לתת למודל הבנה טובה יותר של המשימה
+        better_instruction = f"""
 הנך מתבקש לסכם את השיחה הבאה מקבוצת WhatsApp ב{target_language}.
+
+הערות חשובות:
+1. עליך לחפש ולהתייחס באופן אקטיבי לכל התוכן בהודעות, גם אם מדובר בפרטים קטנים
+2. אל תחזיר תבנית ריקה עם "לא דווח" בכל הסעיפים - אם יש תוכן כלשהו, צרף אותו תחת הקטגוריה המתאימה
+3. אם יש תוכן שאינו מתאים לקטגוריות הקיימות, הוסף הערה בסוף הסיכום
+4. אם סעיף מסוים אכן ריק, רשום "לא דווח" רק עבורו, ולא עבור כל הסעיפים
+5. אם מוזכר תוכן או קישור כלשהו, כלול אותו בסיכום
+6. חשוב מאוד: עליך לסכם את כל המידע המהותי, גם אם מופיע רק פעם אחת בשיחה
+7. אם יש תכנים דומים שחוזרים על עצמם, אחד אותם תחת סעיף אחד
+
 {prompt_template}
+
+כעת נמצאות בפניך ההודעות לסיכום. יש בסך הכל כ-[מספר] הודעות, חלקן אינפורמטיביות וחלקן פחות.
+בכל מקרה, עליך לסרוק את כל ההודעות ולסכם את כל המידע המהותי שנמצא בהן.
 
 CONVERSATION:
 {formatted_messages}
 
 SUMMARY:
-""" 
+"""
+
+        # החלף את המילה [מספר] במספר המשוער של ההודעות
+        message_count = formatted_messages.count('\n') + 1  # הערכה גסה של מספר ההודעות
+        better_instruction = better_instruction.replace('[מספר]', str(message_count))
+        
+        return better_instruction
+
+    def _create_single_message_summary_prompt(self, formatted_message: str, sender: str, text: str, 
+                                            target_language: str) -> str:
+        """
+        Create a prompt specifically for single message summary with context
+        
+        Args:
+            formatted_message (str): Formatted single message
+            sender (str): Message sender
+            text (str): Message text
+            target_language (str): Target language for summary
+            
+        Returns:
+            str: Summary prompt
+        """
+        return f"""
+הנך מתבקש לסכם הודעה בודדת מקבוצת WhatsApp ב{target_language}.
+
+ההודעה היא:
+{sender}: {text}
+
+אני מבקש:
+1. לכתוב סיכום להודעה הבודדת
+2. במידה ולא ניתן להבין את ההקשר המלא, יש להציע הקשר אפשרי או הסבר כללי למשמעות ההודעה
+3. במקרה שההודעה לא ברורה, עליך להדגיש שזוהי הודעה בודדת ללא הקשר קודם
+
+יש לפרמט את הסיכום כך:
+
+### סיכום הודעה בודדת
+
+**הודעה:**
+{sender}: {text}
+
+**ניתוח והסבר:**
+[כאן יש לכתוב ניתוח קצר של ההודעה - מה היא אומרת, למה היא עשויה להתייחס, או מה אפשר להבין ממנה]
+
+SUMMARY:
+"""
+
+    def _create_two_message_summary_prompt(self, formatted_messages: str, target_language: str) -> str:
+        """
+        Create a prompt specifically for summarizing a two-message conversation
+        
+        Args:
+            formatted_messages (str): Formatted messages
+            target_language (str): Target language for summary
+            
+        Returns:
+            str: Summary prompt
+        """
+        return f"""
+הנך מתבקש לסכם שיחה קצרה בת שתי הודעות מקבוצת WhatsApp ב{target_language}.
+
+השיחה הקצרה היא:
+{formatted_messages}
+
+אני מבקש:
+1. לסכם את הדיאלוג הקצר בין שני האנשים
+2. לציין את הנושא העיקרי של הדיאלוג
+3. להסביר את הקשר בין שתי ההודעות
+
+יש לפרמט את הסיכום כך:
+
+### סיכום דיאלוג קצר
+
+**ההודעות:**
+{formatted_messages}
+
+**נושא הדיאלוג:**
+[כאן יש לציין את הנושא העיקרי של הדיאלוג]
+
+**ניתוח:**
+[כאן יש לנתח את הקשר בין ההודעות והמשמעות של השיחה]
+
+SUMMARY:
+"""
+
+    def _standard_summary_flow(self, messages, formatted_messages, target_language):
+        """
+        Standard summary generation flow as a fall-back option
+        
+        Args:
+            messages (List[Dict[str, Any]]): List of messages
+            formatted_messages (str): Pre-formatted messages
+            target_language (str): Target language
+            
+        Returns:
+            str: Generated summary
+        """
+        # Create the prompt
+        prompt = self._create_summary_prompt(formatted_messages, target_language)
+        
+        try:
+            # Call OpenAI API
+            self.logger.info(f"Calling OpenAI API with model {self.model}")
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that summarizes WhatsApp group conversations."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=self.max_tokens,
+                temperature=0.7
+            )
+            
+            # Validate response
+            if not response or not hasattr(response, 'choices') or not response.choices:
+                error_msg = "OpenAI API returned an invalid response format"
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
+            
+            # Extract summary from response
+            summary = response.choices[0].message.content.strip()
+            
+            # Validate summary
+            if not summary:
+                error_msg = "OpenAI API returned an empty summary"
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
+            
+            self.logger.info("Summary generated successfully")
+            return summary
+            
+        except openai.APIError as e:
+            error_msg = f"OpenAI API error: {str(e)}"
+            self.logger.error(error_msg)
+            # Add request details to help diagnose the issue
+            self.logger.error(f"Request details: model={self.model}, max_tokens={self.max_tokens}")
+            
+            # Create a basic fallback summary since we're already in a fallback method
+            self.logger.info("Creating basic fallback summary due to API error")
+            msg_texts = [f"{msg.get('senderName', 'Unknown')}: {msg.get('textMessage', '')}" 
+                        for msg in messages if 'textMessage' in msg]
+            return f"### סיכום בסיסי (בעקבות שגיאת API)\n\n" + "\n".join(msg_texts)
+
+        except openai.RateLimitError as e:
+            error_msg = f"OpenAI rate limit exceeded: {str(e)}"
+            self.logger.error(error_msg)
+            
+            # Create a basic fallback summary
+            self.logger.info("Creating basic fallback summary due to rate limit")
+            msg_texts = [f"{msg.get('senderName', 'Unknown')}: {msg.get('textMessage', '')}" 
+                        for msg in messages if 'textMessage' in msg]
+            return f"### סיכום בסיסי (בעקבות הגבלת קצב API)\n\n" + "\n".join(msg_texts)
+
+        except openai.APIConnectionError as e:
+            error_msg = f"Failed to connect to OpenAI API: {str(e)}"
+            self.logger.error(error_msg)
+            
+            # Create a basic fallback summary
+            self.logger.info("Creating basic fallback summary due to connection error")
+            msg_texts = [f"{msg.get('senderName', 'Unknown')}: {msg.get('textMessage', '')}" 
+                        for msg in messages if 'textMessage' in msg]
+            return f"### סיכום בסיסי (בעקבות שגיאת חיבור)\n\n" + "\n".join(msg_texts)
+
+        except openai.InvalidRequestError as e:
+            error_msg = f"Invalid request to OpenAI API: {str(e)}"
+            self.logger.error(error_msg)
+            # Log additional details about the request
+            self.logger.error(f"Request details: model={self.model}, prompt_length={len(prompt)}")
+            
+            # Create a basic fallback summary
+            self.logger.info("Creating basic fallback summary due to invalid request")
+            msg_texts = [f"{msg.get('senderName', 'Unknown')}: {msg.get('textMessage', '')}" 
+                        for msg in messages if 'textMessage' in msg]
+            return f"### סיכום בסיסי (בעקבות בקשה לא תקינה)\n\n" + "\n".join(msg_texts)
+            
+        except Exception as e:
+            self.logger.error(f"Error in standard summary flow: {str(e)}")
+            # Create a very simple fallback summary
+            self.logger.info("Creating basic fallback summary due to unexpected error")
+            msg_texts = [f"{msg.get('senderName', 'Unknown')}: {msg.get('textMessage', '')}" 
+                        for msg in messages if 'textMessage' in msg]
+            return f"### סיכום בסיסי\n\n" + "\n".join(msg_texts) 

@@ -234,347 +234,204 @@ def select_group(components):
         except Exception as e:
             print(f"❌ Error: {str(e)}")
 
-def generate_summary(components, group_id, days=1, debug=False):
-    """Generate a summary of recent messages"""
-    green_api_client = components['green_api_client']
-    message_processor = components['message_processor']
-    openai_client = components['openai_client']
-    supabase_client = components['supabase_client']
+def generate_summary(components, group_id=None, days=None, use_api=True):
+    """
+    Generate a summary for a group's messages.
     
+    Args:
+        components (dict): Dictionary of initialized components
+        group_id (str, optional): Group ID. If None, user will be prompted to select.
+        days (int, optional): Number of days to include. If None, user will be prompted.
+        use_api (bool): Whether to fetch new messages from API or use existing from DB
+        
+    Returns:
+        str: Generated summary or None if errors occurred
+    """
     try:
-        print(f"\nGenerating summary for the last {days} days using fresh WhatsApp messages...")
+        # Log the start of summary generation
         logger.info(f"Starting summary generation process")
-        logger.info(f"Generating summary for the last {days} days using fresh WhatsApp messages...")
-
-        # Fetch recent messages
-        if debug:
-            print("\n⏳ Fetching messages...")
-        logger.info(f"Fetching messages from API for group {group_id}")
-        messages = green_api_client.get_chat_history(group_id)
         
-        if not messages:
-            logger.warning("No messages found from API")
-            if debug:
-                print("❌ No messages found")
-            return "אין הודעות לסיכום."
-        
-        logger.info(f"Retrieved {len(messages)} messages from API")
-        if debug:
-            print(f"✅ Found {len(messages)} messages")
+        # Validate components
+        required_components = ['supabase_client', 'message_processor', 'openai_client']
+        if use_api:
+            required_components.append('group_manager')
+            required_components.append('green_api_client')
             
-            # Print a sample message
-            if messages:
-                print("\nSample message structure:")
-                sample_msg = messages[0]
-                # Print only the keys to avoid overwhelming output
-                print(f"Message keys: {list(sample_msg.keys())}")
-                print("\nTimestamp information:")
-                if 'timestamp' in sample_msg:
-                    ts = sample_msg['timestamp']
-                    print(f"- Timestamp value: {ts}")
-                    print(f"- Timestamp type: {type(ts).__name__}")
-                    # Try to interpret the timestamp
-                    if isinstance(ts, int) or isinstance(ts, float):
-                        try:
-                            as_seconds = datetime.fromtimestamp(ts)
-                            print(f"- As seconds since epoch: {as_seconds}")
-                        except:
-                            print("- Failed to interpret as seconds since epoch")
-                        try:
-                            as_milliseconds = datetime.fromtimestamp(ts / 1000)
-                            print(f"- As milliseconds since epoch: {as_milliseconds}")
-                        except:
-                            print("- Failed to interpret as milliseconds since epoch")
-                else:
-                    print("- No timestamp field found in the message")
+        for component in required_components:
+            if component not in components:
+                error_msg = f"Missing required component: {component}"
+                logger.error(error_msg)
+                return None
                 
-                # Print other relevant fields
-                print("\nOther key fields:")
-                for key in ['senderName', 'textMessage', 'senderId', 'type']:
-                    if key in sample_msg:
-                        print(f"- {key}: {sample_msg[key]}")
+        supabase_client = components['supabase_client']
+        message_processor = components['message_processor']
+        openai_client = components['openai_client']
         
-        # Filter messages by date
-        cutoff_date = datetime.now() - timedelta(days=days)
-        logger.info(f"Filtering messages since {cutoff_date}")
+        # Get group ID if not provided
+        if not group_id:
+            from menu.groups import select_group
+            group_id = select_group(components)
+            if not group_id:
+                logger.error("No group selected for summary generation")
+                return None
+                
+        # Get number of days if not provided
+        if days is None:
+            days = select_days()
+            if days is None:
+                logger.error("No time period selected for summary generation")
+                return None
+                
+        # Fetch messages based on the source selection (API or Database)
+        messages = []
         
-        # Manual filtering (bypassing the filter_messages_by_date function to debug the issue)
-        filtered_messages = []
-        timestamp_issues = []
-        
-        for message in messages:
+        if use_api:
+            # Try to get messages from the API
+            logger.info(f"Generating summary for the last {days} days using fresh WhatsApp messages...")
+            
+            group_manager = components['group_manager']
+            green_api = components['green_api_client']
+            
             try:
-                if 'timestamp' not in message:
-                    continue
-                    
-                ts = message['timestamp']
-                msg_date = None
+                logger.info(f"Fetching messages from API for group {group_id}")
                 
-                # Handle Unix timestamp (integer)
-                if isinstance(ts, int) or isinstance(ts, float):
-                    try:
-                        # Try as seconds since epoch
-                        msg_date = datetime.fromtimestamp(ts)
-                    except Exception as e1:
-                        try:
-                            # Try as milliseconds since epoch
-                            msg_date = datetime.fromtimestamp(ts / 1000)
-                        except Exception as e2:
-                            timestamp_issues.append(f"Couldn't parse timestamp {ts}: {str(e2)}")
-                            continue
+                # Minimum messages we want to work with after processing
+                min_processed_messages = 100
                 
-                # Handle string timestamps
-                elif isinstance(ts, str):
-                    try:
-                        # Try parsing with timezone info
-                        msg_date = datetime.fromisoformat(ts.replace('Z', '+00:00'))
-                        # Convert to naive datetime for comparison
-                        msg_date = msg_date.replace(tzinfo=None)
-                    except Exception as e1:
-                        try:
-                            # Try parsing without timezone info
-                            msg_date = datetime.fromisoformat(ts)
-                        except Exception as e2:
-                            try:
-                                # Try parsing with standard format
-                                msg_date = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-                            except Exception as e3:
-                                timestamp_issues.append(f"Couldn't parse string timestamp {ts}")
-                                continue
+                # Start with a higher count request to account for filtering
+                initial_message_count = 200
                 
-                # Handle datetime objects
-                elif isinstance(ts, datetime):
-                    msg_date = ts.replace(tzinfo=None) if ts.tzinfo else ts
+                # Check which method is available for fetching chat history
+                if hasattr(group_manager, 'get_chat_history') and callable(getattr(group_manager, 'get_chat_history')):
+                    api_messages = group_manager.get_chat_history(group_id, count=initial_message_count, min_count=min_processed_messages)
+                elif hasattr(green_api, 'get_chat_history') and callable(getattr(green_api, 'get_chat_history')):
+                    api_messages = green_api.get_chat_history(group_id, count=initial_message_count, min_count=min_processed_messages)
+                elif hasattr(group_manager, 'fetch_messages') and callable(getattr(group_manager, 'fetch_messages')):
+                    api_messages = group_manager.fetch_messages(group_id, days)
                 else:
-                    timestamp_issues.append(f"Unsupported timestamp type: {type(ts).__name__}")
-                    continue
+                    logger.error("No suitable method found to fetch chat history from API")
+                    api_messages = []
                 
-                # Check if message is within the time range
-                if msg_date and msg_date >= cutoff_date:
-                    filtered_messages.append(message)
+                if api_messages and len(api_messages) > 0:
+                    messages = api_messages
+                    logger.info(f"Retrieved {len(messages)} messages from API")
+                else:
+                    logger.warning("No messages retrieved from API, falling back to database")
             except Exception as e:
-                timestamp_issues.append(f"Error processing message: {str(e)}")
+                logger.error(f"Error fetching messages from API: {str(e)}", exc_info=True)
+                print(f"⚠️ API Error: {str(e)}")
+                logger.info("Falling back to database for messages")
         
-        # Log filtering results
-        logger.info(f"Filtered {len(filtered_messages)} messages out of {len(messages)}")
-        
-        if debug:
-            print(f"\nFiltered messages: {len(filtered_messages)} out of {len(messages)}")
-            if timestamp_issues:
-                print("\nTimestamp parsing issues:")
-                for i, issue in enumerate(timestamp_issues[:5]):  # Show only first 5 issues
-                    print(f"{i+1}. {issue}")
-                if len(timestamp_issues) > 5:
-                    print(f"... and {len(timestamp_issues) - 5} more issues")
-        
-        if not filtered_messages:
-            logger.warning(f"No messages found in the last {days} days")
-            if debug:
-                print("❌ No messages found in the specified time period")
-            return "אין הודעות בטווח הזמן המבוקש."
-        
-        # Process messages
-        if debug:
-            print("\n⏳ Processing messages...")
-            # Enable debug mode on the message processor to get detailed logs
-            if hasattr(message_processor, 'set_debug_mode'):
-                message_processor.set_debug_mode(True)
-            
-        # Add a sample message log for debugging
-        if debug and filtered_messages:
-            print("\nSample message to be processed:")
-            print(f"- Message ID: {filtered_messages[0].get('idMessage', 'Unknown')}")
-            print(f"- Message keys: {list(filtered_messages[0].keys())}")
-            if 'timestamp' in filtered_messages[0]:
-                print(f"- Timestamp: {filtered_messages[0]['timestamp']}")
-            if 'senderName' in filtered_messages[0]:
-                print(f"- Sender: {filtered_messages[0]['senderName']}")
-            if 'textMessage' in filtered_messages[0]:
-                print(f"- Text: {filtered_messages[0]['textMessage'][:50]}...")
-            if 'extendedTextMessage' in filtered_messages[0]:
-                print("- Has extendedTextMessage field")
+        # If we don't have messages yet or weren't using API, try to get from database
+        if not messages:
+            if not use_api:
+                logger.info("Using database for messages instead of API")
                 
-        processed_messages = message_processor.process_messages(filtered_messages)
+            try:
+                start_time = datetime.now() - timedelta(days=days)
+                messages = supabase_client.get_messages(group_id, start_time)
+                logger.info(f"Retrieved {len(messages)} messages from database")
+            except Exception as e:
+                logger.error(f"Error fetching messages from database: {str(e)}")
+                print(f"⚠️ Database Error: {str(e)}")
+                
+        # If still no messages, abort
+        if not messages:
+            logger.error("No messages found from any source")
+            print("❌ No messages found from any source. Cannot generate summary.")
+            return "אין הודעות זמינות לסיכום."
+        else:
+            print(f"✅ Retrieved {len(messages)} messages")
         
-        if not processed_messages:
-            logger.warning("No valid messages after processing")
-            if debug:
-                print("❌ No valid messages after processing")
-                print("Common reasons for message rejection:")
-                print("- Messages start with command prefixes (/, !, .)")
-                print("- Messages have empty text content")
-                print("- Messages have unsupported formats")
-                print("- The message processing logic can't extract text from the message format")
-                print("\nCheck the application logs for detailed rejection reasons.")
-            return "אין הודעות תקפות לסיכום אחרי עיבוד."
+        # Process the messages
+        logger.info(f"Processing {len(messages)} messages")
+        processed_messages = message_processor.process_messages(messages)
         
-        logger.info(f"Successfully processed {len(processed_messages)} messages")
-        if debug:
-            print(f"✅ Processed {len(processed_messages)} valid messages")
+        # Check if we have enough processed messages
+        min_messages_for_summary = 100
+        attempts = 0
+        max_attempts = 3
+        
+        while len(processed_messages) < min_messages_for_summary and attempts < max_attempts:
+            attempts += 1
+            logger.info(f"Only {len(processed_messages)} messages after processing, which is less than the minimum {min_messages_for_summary}. Fetching more (attempt {attempts}/{max_attempts})")
+            print(f"\n⏳ Only {len(processed_messages)} messages after processing. Fetching more messages... (attempt {attempts}/{max_attempts})")
             
-            # Print a sample processed message
-            if processed_messages:
-                print("\nSample processed message:")
-                sample = json.dumps(processed_messages[0], indent=2, ensure_ascii=False)
-                # Truncate sample if too long
-                if len(sample) > 500:
-                    sample = sample[:500] + "..."
-                print(sample)
+            try:
+                # Double the count each time
+                new_count = initial_message_count * (2 ** attempts)
+                
+                # Fetch more messages
+                if hasattr(green_api, 'get_chat_history') and callable(getattr(green_api, 'get_chat_history')):
+                    more_messages = green_api.get_chat_history(group_id, count=new_count, min_count=min_messages_for_summary*2)
+                    if more_messages:
+                        # Process the new messages
+                        logger.info(f"Retrieved {len(more_messages)} additional messages")
+                        more_processed = message_processor.process_messages(more_messages)
+                        
+                        # Combine with existing messages, avoiding duplicates
+                        existing_ids = {msg.get('idMessage') for msg in processed_messages if 'idMessage' in msg}
+                        for msg in more_processed:
+                            if msg.get('idMessage') not in existing_ids:
+                                processed_messages.append(msg)
+                        
+                        logger.info(f"Now have {len(processed_messages)} processed messages after fetching more")
+                        print(f"✅ Now have {len(processed_messages)} processed messages")
+                else:
+                    logger.warning("Cannot fetch more messages - get_chat_history method not available")
+                    break
+            except Exception as e:
+                logger.error(f"Error fetching additional messages: {str(e)}")
+                print(f"⚠️ Error fetching more messages: {str(e)}")
+                break
         
-        # Store messages in database if available
+        # If still not enough messages, continue with what we have but log a warning
+        if len(processed_messages) < min_messages_for_summary:
+            logger.warning(f"Could only obtain {len(processed_messages)} processed messages, which is less than the ideal minimum {min_messages_for_summary}")
+            print(f"\n⚠️ Could only obtain {len(processed_messages)} messages for summarization, which is less than the ideal minimum of {min_messages_for_summary}")
+            
+            if len(processed_messages) == 0:
+                logger.error("No valid messages after processing")
+                print("❌ No valid messages after processing. Cannot generate summary.")
+                return "אין הודעות תקפות לסיכום אחרי עיבוד."
+        else:
+            print(f"\n✅ Successfully processed {len(processed_messages)} messages for summarization")
+        
+        # Try to store messages in the database
         if supabase_client:
             try:
-                if debug:
-                    print("\n⏳ Storing messages in database...")
                 start_time = datetime.now() - timedelta(days=days)
                 message_count = supabase_client.store_messages(processed_messages, group_id)
-                if debug:
-                    print(f"✅ Stored {message_count} messages in database")
+                logger.info(f"Stored {message_count} messages in database")
             except Exception as e:
-                logger.warning(f"Failed to store messages in database: {str(e)}")
-                if debug:
-                    print(f"⚠️ Could not store messages in database: {str(e)}")
-        else:
-            if debug:
-                print("\n⚠️ Database connection not available, skipping message storage")
+                logger.warning(f"Could not store messages in database: {str(e)}")
+                print(f"⚠️ Database storage warning: {str(e)}")
         
         # Generate the summary
-        max_retries = 3
-        retry_delay = 5  # seconds
+        logger.info(f"Generating summary from {len(processed_messages)} messages")
+        print(f"\n⏳ Generating summary from {len(processed_messages)} messages using OpenAI...")
         
-        if debug:
-            print("\n⏳ Generating summary with OpenAI...")
-        logger.info("Generating summary using OpenAI")
+        summary = openai_client.generate_summary(processed_messages)
         
-        # Check if we have something to summarize
-        if not processed_messages:
-            logger.error("No processed messages available for summarization")
-            if debug:
-                print("❌ No messages available for summarization")
-            return "אין הודעות זמינות לסיכום."
-        
-        # Log message count and date range for clarity
-        logger.info(f"Attempting to summarize {len(processed_messages)} messages")
-        
-        if debug:
-            # Show date range of messages being summarized
-            try:
-                if processed_messages:
-                    dates = []
-                    for msg in processed_messages:
-                        if 'timestamp' in msg:
-                            if isinstance(msg['timestamp'], str):
-                                try:
-                                    dates.append(datetime.fromisoformat(msg['timestamp'].replace('Z', '+00:00')))
-                                except:
-                                    pass
-                    if dates:
-                        earliest = min(dates)
-                        latest = max(dates)
-                        print(f"Message date range: {earliest} to {latest}")
-            except Exception as e:
-                print(f"Error analyzing message dates: {str(e)}")
-        
-        summary = None
-        
-        # Generate summary with retries
-        for attempt in range(max_retries):
-            try:
-                summary = openai_client.generate_summary(processed_messages)
-                
-                # Log summary info for debugging
-                if summary and len(summary) > 0:
-                    summary_preview = summary[:50] + "..." if len(summary) > 50 else summary
-                    logger.info(f"Summary generated successfully: {len(summary)} chars")
-                    logger.info(f"Summary preview: {summary_preview}")
-                    if debug:
-                        print("✅ Summary generated successfully")
-                else:
-                    logger.warning("OpenAI returned empty summary")
-                    if debug:
-                        print("⚠️ OpenAI returned empty summary")
-                
-                break
-            except Exception as e:
-                logger.warning(f"Error generating summary (attempt {attempt+1}/{max_retries}): {str(e)}")
-                if attempt < max_retries - 1:
-                    if debug:
-                        print(f"⚠️ Error generating summary (attempt {attempt+1}/{max_retries}): {str(e)}")
-                        print(f"Retrying in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
-                else:
-                    logger.error(f"Failed to generate summary after {max_retries} attempts: {str(e)}")
-                    if debug:
-                        print(f"❌ Failed to generate summary after {max_retries} attempts: {str(e)}")
-                    return f"שגיאה בזמן יצירת הסיכום: {str(e)}"
-        
-        # Validate the summary
-        if not summary or summary.strip() == "":
-            logger.error("Invalid summary generated")
-            if debug:
-                print("❌ Summary is empty or invalid")
-            return "נכשל ביצירת סיכום תקף."
-            
-        # Print summary preview
-        if debug:
-            print("\nSummary Preview:")
-            preview_lines = summary.split('\n')[:5]  # First 5 lines
-            print('\n'.join(preview_lines))
-            if len(summary.split('\n')) > 5:
-                print("...")
-        
-        # Store summary in database if available
+        # Store the summary in the database
         if supabase_client:
             try:
-                if debug:
-                    print("\n⏳ Storing summary in database...")
-                
                 end_time = datetime.now()
                 start_time = end_time - timedelta(days=days)
                 
-                try:
-                    supabase_client.store_summary(
-                        summary=summary,
-                        group_id=group_id,
-                        start_time=start_time,
-                        end_time=end_time,
-                        message_count=len(processed_messages),
-                        model_used=openai_client.model
-                    )
-                    logger.info("Summary stored in database successfully")
-                    if debug:
-                        print("✅ Summary stored in database")
-                except Exception as e:
-                    logger.warning(f"Primary storage method failed: {str(e)}")
-                    if debug:
-                        print(f"⚠️ Primary storage method failed, trying alternate method...")
-                    
-                    # Try alternate method with client.from_
-                    supabase_client.client.from_('summaries').insert({
-                        'id': str(uuid.uuid4()),
-                        'group_id': group_id,
-                        'content': summary,
-                        'generated_at': datetime.now().isoformat(),
-                        'start_time': start_time.isoformat(),
-                        'end_time': end_time.isoformat(),
-                        'message_count': len(processed_messages),
-                        'model_used': openai_client.model
-                    }).execute()
-                    
-                    logger.info("Summary stored in database using alternative method")
-                    if debug:
-                        print("✅ Summary stored in database (alternative method)")
-                
+                supabase_client.store_summary(
+                    summary=summary,
+                    group_id=group_id,
+                    start_time=start_time,
+                    end_time=end_time,
+                    message_count=len(processed_messages),
+                    model_used=openai_client.model
+                )
+                logger.info("Summary stored in database")
             except Exception as e:
-                logger.error(f"Could not store summary in database: {str(e)}")
-                if debug:
-                    print(f"⚠️ Could not store summary in database: {str(e)}")
-        else:
-            logger.info("Skipping summary storage (no database connection)")
-            if debug:
-                print("\n⚠️ Database connection not available, skipping summary storage")
+                logger.warning(f"Could not store summary in database: {str(e)}")
+                print(f"⚠️ Database storage warning: {str(e)}")
         
-        logger.info("Summary generation completed successfully")
         return summary
         
     except Exception as e:

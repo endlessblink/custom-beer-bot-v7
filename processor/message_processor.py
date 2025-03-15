@@ -13,27 +13,28 @@ import re
 import emoji
 from datetime import datetime
 from typing import Any, Dict, List, Optional
+import time
 
 
 class MessageProcessor:
     """
     Message Processor for WhatsApp messages
     
-    This class provides methods for processing and preparing WhatsApp messages
-    for summarization.
+    This class provides methods for processing WhatsApp messages,
+    filtering out irrelevant content, and extracting information.
     """
     
-    def __init__(self, target_language: str = "hebrew"):
+    def __init__(self, target_language='hebrew'):
         """
         Initialize the message processor
         
         Args:
-            target_language (str, optional): Target language for processing. Defaults to "hebrew".
+            target_language (str, optional): Target language for processing. Defaults to 'hebrew'.
         """
         self.target_language = target_language
         self.logger = logging.getLogger(__name__)
-        self.logger.info("Message processor initialized")
-        self.debug_mode = False
+        self.logger.info(f"Message processor initialized with target language: {target_language}")
+        self._debug_mode = False  # Add debug mode flag
         
         # Commands to filter out (messages starting with these will be ignored)
         self.command_prefixes = ['!', '/', '.']
@@ -58,91 +59,155 @@ class MessageProcessor:
             'incoming',
             'outgoing'
         ]
-    
-    def set_debug_mode(self, enabled: bool = True):
-        """Enable or disable debug mode"""
-        self.debug_mode = enabled
-        self.logger.info(f"Debug mode {'enabled' if enabled else 'disabled'}")
         
-    def process_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        # Reduced filtering - set to True to be more permissive with messages
+        # This allows for including more messages in the summary
+        self.reduced_filtering = True
+        self.logger.info("Initialized with reduced filtering: messages with minimal content will be included")
+    
+    def set_debug_mode(self, enabled=True):
         """
-        Process a list of messages
+        Enable or disable debug mode
+        
+        In debug mode, less filtering is applied to messages to help with
+        troubleshooting issues with message processing.
         
         Args:
-            messages (List[Dict[str, Any]]): List of messages to process
+            enabled (bool, optional): Whether to enable debug mode. Defaults to True.
+        """
+        self._debug_mode = enabled
+        self.logger.info(f"Debug mode {'enabled' if enabled else 'disabled'}")
+        return self._debug_mode
+    
+    def get_debug_mode(self):
+        """
+        Check if debug mode is enabled
+        
+        Returns:
+            bool: Whether debug mode is enabled
+        """
+        return self._debug_mode
+    
+    def process_messages(self, messages):
+        """
+        Process a list of WhatsApp messages
+        
+        Args:
+            messages (list): List of WhatsApp message objects
             
         Returns:
-            List[Dict[str, Any]]: Processed messages
+            list: List of processed message objects
         """
+        if not messages:
+            self.logger.warning("No messages to process")
+            return []
+            
         self.logger.info(f"Processing {len(messages)} messages")
         
+        # Initialize counters for stats
+        processed = 0
+        rejected = 0
+        
+        # Initialize result list
         processed_messages = []
-        rejected_messages = []
         
-        # Print to console for visibility
-        print(f"Processing {len(messages)} messages...")
+        # Define command prefixes to filter out
+        command_prefixes = [
+            '!', '/', '.', '#',  # Common command prefixes
+            '/summary', '!summary', '.summary', '#summary',  # Summary commands
+            '/poll', '!poll', '.poll', '#poll',  # Poll commands
+            '/help', '!help', '.help', '#help',  # Help commands
+        ]
         
-        # Add detailed debug output before processing
-        self.logger.info(f"Message processing started with {len(messages)} messages")
-        if len(messages) > 0:
-            self._debug_message_structure(messages[0])
+        # Check debug mode for logging
+        if self._debug_mode:
+            self.logger.info("Processing messages in debug mode - less strict filtering will be applied")
         
-        for idx, message in enumerate(messages):
-            # Log each message being processed more extensively
-            if self.debug_mode:
-                self.logger.debug(f"Processing message {idx+1}/{len(messages)}")
-                self._debug_message_structure(message)
+        # Process each message
+        for message in messages:
+            try:
+                processed += 1
                 
-            processed = self._process_message(message)
-            if processed:
-                processed_messages.append(processed)
-                if self.debug_mode:
-                    self.logger.debug(f"Message {idx} accepted: {message.get('idMessage', 'Unknown ID')}")
-            else:
-                rejected_messages.append(message)
-                # Always log rejected messages regardless of debug mode
-                self.logger.info(f"Message {idx+1} rejected: {message.get('idMessage', 'Unknown ID')}")
-                # Do a detailed analysis of why the message was rejected
-                self._debug_rejected_message(message, idx)
-        
-        # Log processing results
-        self.logger.info(f"Processed {len(processed_messages)} messages, rejected {len(rejected_messages)} messages")
-        
-        # Always print summary info to console for visibility
-        print(f"Processed {len(processed_messages)} messages, rejected {len(rejected_messages)} messages")
-        
-        if rejected_messages:
-            rejected_types = {}
-            for msg in rejected_messages:
-                msg_type = self._get_message_type(msg) or "unknown"
-                rejected_types[msg_type] = rejected_types.get(msg_type, 0) + 1
+                # Basic validation - make sure we have the minimum required fields
+                if ('typeMessage' not in message or 
+                    ('chatId' not in message and 'chatId' not in message and 'chat_id' not in message)):
+                    rejected += 1
+                    continue
                 
-            self.logger.info(f"Rejected message types: {rejected_types}")
-            
-            # Print rejected types summary to console for visibility
-            if len(rejected_types) > 0:
-                print(f"Rejected message types: {rejected_types}")
-            
-            if len(processed_messages) == 0:
-                # Critical issue: all messages were rejected - log detailed reason
-                self.logger.warning("ALL MESSAGES WERE REJECTED - Check the message processor logic")
-                # Always print this critical error to console
-                print("\n⚠️ CRITICAL: ALL MESSAGES WERE REJECTED")
-                print("Common rejection reasons:")
-                print("- Messages start with command prefixes (/, !, .)")
-                print("- Messages have empty text content")
-                print("- Messages have unsupported formats")
-                # Print the first 3 rejected messages for debugging
-                for i, msg in enumerate(rejected_messages[:3]):
-                    self.logger.warning(f"Rejected message {i+1} details:")
-                    self._debug_message_structure(msg, level="WARNING")
-                    # Print basic info about rejected messages to console
-                    msg_id = msg.get('idMessage', f'Unknown ID {i+1}')
-                    msg_type = self._get_message_type(msg) or "unknown"
-                    has_text = 'textMessage' in msg
-                    if self.debug_mode:
-                        print(f"Message {i+1}: ID={msg_id}, Type={msg_type}, Has text: {has_text}")
+                # In debug mode, we'll keep system messages and others normally filtered
+                if not self._debug_mode:
+                    # Filter out system messages
+                    if message.get('typeMessage') == 'service':
+                        rejected += 1
+                        continue
+                    
+                    # Filter out poll messages 
+                    if message.get('typeMessage') == 'poll':
+                        rejected += 1
+                        continue
+                        
+                    # Filter out certain message types that aren't useful for summaries
+                    if (message.get('typeMessage') in ['reaction', 'sticker'] and 
+                        not self._debug_mode):  # In debug mode, keep these message types
+                        rejected += 1
+                        continue
+                    
+                    # Filter out command messages (if in normal mode)
+                    if message.get('typeMessage') == 'textMessage':
+                        text = message.get('textMessage', '')
+                        if text and text[0] in command_prefixes:
+                            rejected += 1
+                            continue
+                            
+                        if text and any(text.startswith(prefix) for prefix in command_prefixes):
+                            rejected += 1
+                            continue
+                
+                # Handle direct message format
+                if ('typeMessage' in message and 
+                    'textMessage' in message and 
+                    'senderName' in message):
+                    processed_messages.append(message)
+                    continue
+                
+                # Handle alternative structure
+                if 'type' in message and 'message' in message:
+                    # Convert to standard format
+                    standard_message = {
+                        'typeMessage': message.get('type'),
+                        'chatId': message.get('chat_id', ''),
+                        'senderName': message.get('sender_name', ''),
+                        'timestamp': message.get('timestamp', '')
+                    }
+                    
+                    # Add message text if available
+                    if message['type'] == 'text' and 'text' in message['message']:
+                        standard_message['textMessage'] = message['message']['text']
+                    
+                    # Add image caption if available
+                    elif message['type'] == 'image' and 'caption' in message['message']:
+                        standard_message['textMessage'] = message['message']['caption']
+                    
+                    # Add quote data if available
+                    if 'quoted' in message and message['quoted']:
+                        standard_message['quotedMessage'] = message['quoted']
+                    
+                    processed_messages.append(standard_message)
+                    continue
+                
+                # If we couldn't process it in a standard way, append it anyway
+                # in debug mode, otherwise skip it
+                if self._debug_mode:
+                    processed_messages.append(message)
+                else:
+                    rejected += 1
+                
+            except Exception as e:
+                self.logger.error(f"Error processing message: {str(e)}")
+                rejected += 1
         
+        self.logger.info(f"Processed {processed} messages, rejected {rejected} messages")
+        self.logger.info(f"Returning {len(processed_messages)} processed messages")
         return processed_messages
     
     def _debug_message_structure(self, message: Dict[str, Any], level: str = "DEBUG") -> None:
@@ -277,149 +342,152 @@ class MessageProcessor:
             sender = message.get('senderName', 'Unknown')
             message_id = message.get('idMessage', 'Unknown')
             
-            if self.debug_mode:
+            if self._debug_mode:
                 self.logger.debug(f"Processing message {message_id} from {sender}")
                 # Print message keys for debugging
                 self.logger.debug(f"Message keys: {list(message.keys())}")
         except Exception as e:
-            if self.debug_mode:
+            if self._debug_mode:
                 self.logger.debug(f"Error processing message metadata: {str(e)}")
         
         # DIRECT MESSAGE FORMAT: Check if this is a direct message format (new API structure)
         if 'type' in message and message['type'] in ['incoming', 'outgoing'] and 'textMessage' in message:
             return self._process_direct_message_format(message)
-        
-        # Also check if 'textMessage' is directly in the message (alternative simple format)
-        if 'textMessage' in message and 'senderName' in message and 'timestamp' in message:
-            # Log this special case
-            self.logger.debug(f"Processing simple format message with direct textMessage field")
-            # Create processed message directly from simple format
-            return {
-                'senderName': message.get('senderName', 'Unknown'),
-                'textMessage': message.get('textMessage', ''),
-                'timestamp': self._format_timestamp(message.get('timestamp', 0)),
-                'type': message.get('type', 'textMessage')
-            }
-        
-        # SPECIAL CASE FOR GREEN API MESSAGES WITH EXTENDED TEXT:
-        # This handles the format seen in the log where we have a message with 'extendedTextMessage'
-        # directly in the message object (not inside messageData)
-        if 'extendedTextMessage' in message and 'timestamp' in message:
-            self.logger.debug(f"Processing message with direct extendedTextMessage field")
             
-            # Try to extract the text from the extendedTextMessage
-            text = ""
-            try:
-                # Check if extendedTextMessage has 'text' field
-                if isinstance(message['extendedTextMessage'], dict) and 'text' in message['extendedTextMessage']:
-                    text = message['extendedTextMessage']['text']
-                # If it's just a string, use it directly
-                elif isinstance(message['extendedTextMessage'], str):
-                    text = message['extendedTextMessage']
-                    
-                # If no text was extracted, check for other potential fields
-                if not text and isinstance(message['extendedTextMessage'], dict):
-                    if 'caption' in message['extendedTextMessage']:
-                        text = message['extendedTextMessage']['caption']
-                    elif 'conversation' in message['extendedTextMessage']:
-                        text = message['extendedTextMessage']['conversation']
+        # Handle messages with typeMessage field but without message content (common for media)
+        if 'typeMessage' in message and not message.get('textMessage'):
+            type_message = message.get('typeMessage', '').lower()
+            # Check if this is a media message type
+            is_media = any(media_type in type_message for media_type in ['image', 'video', 'audio', 'document', 'sticker'])
+            
+            if is_media:
+                # It's a media message without text - create a placeholder message
+                caption = message.get('caption', '')
+                media_type = next((mt for mt in ['image', 'video', 'audio', 'document', 'sticker'] 
+                                  if mt in type_message), 'media')
                 
-                # If still no text, try typeMessage
-                if not text and 'typeMessage' in message:
-                    text = f"[{message['typeMessage'].upper()}]"
-                    
-                # If still no text, use a placeholder
-                if not text:
-                    text = "[EXTENDED MESSAGE]"
+                # Get timestamp
+                timestamp = self._format_timestamp(message.get('timestamp', 0))
                 
-                # Handle command prefixes
-                if any(text.startswith(prefix) for prefix in self.command_prefixes):
-                    self.logger.debug("Skipping extended message: command message")
-                    return None
-                
-                # Create processed message
+                # Create a processed message with the media type
                 return {
-                    'senderName': message.get('senderName', 'Unknown'),
-                    'textMessage': text,
-                    'timestamp': self._format_timestamp(message.get('timestamp', 0)),
-                    'type': 'extendedTextMessage'
+                    'senderName': sender,
+                    'textMessage': f"[{media_type.upper()}] {caption}",
+                    'timestamp': timestamp,
+                    'typeMessage': f"{media_type}Message",
+                    'idMessage': message_id
                 }
-            except Exception as e:
-                self.logger.warning(f"Error processing extendedTextMessage: {str(e)}")
-                
-        # Extract message type
+        
+        # Get message type
         message_type = self._get_message_type(message)
         
-        # Debug message type detection
-        if self.debug_mode:
-            self.logger.debug(f"Detected message type: {message_type}")
+        # Handle different message structures based on type
+        if message_type:
+            # Check if message type is supported
+            if message_type in self.supported_message_types:
+                # Try to extract text based on the message type
+                text = self._extract_text(message, message_type)
+                
+                # Skip command messages unless we're in reduced filtering mode
+                skip_commands = not self.reduced_filtering
+                if skip_commands and text and any(text.startswith(prefix) for prefix in self.command_prefixes):
+                    if self._debug_mode:
+                        self.logger.debug(f"Skipping command message: {text[:30]}...")
+                    return None
+                
+                # Skip empty messages unless we're in reduced filtering mode
+                if not text:
+                    if self.reduced_filtering:
+                        # Try to construct a meaningful placeholder
+                        if message_type == 'imageMessage':
+                            text = "[IMAGE]"
+                        elif message_type == 'videoMessage':
+                            text = "[VIDEO]"
+                        elif message_type == 'audioMessage':
+                            text = "[AUDIO]"
+                        elif message_type == 'documentMessage':
+                            text = "[DOCUMENT]"
+                        elif message_type == 'stickerMessage':
+                            text = "[STICKER]"
+                        elif message_type == 'locationMessage':
+                            text = "[LOCATION]"
+                        elif message_type == 'contactMessage':
+                            text = "[CONTACT]"
+                        elif message_type == 'reactionMessage':
+                            # Try to extract reaction details
+                            reaction_text = message.get('messageData', {}).get('reactionMessage', {}).get('reaction', '👍')
+                            text = f"[REACTION: {reaction_text}]"
+                        else:
+                            # Generic non-empty placeholder for any message type
+                            text = f"[{message_type.upper()}]"
+                    else:
+                        if self._debug_mode:
+                            self.logger.debug(f"Skipping empty message of type {message_type}")
+                        return None
+                
+                # Format timestamp
+                timestamp = self._format_timestamp(message.get('timestamp', 0))
+                
+                # Create a processed message
+                processed = {
+                    'senderName': message.get('senderName', 'Unknown'),
+                    'textMessage': text,
+                    'timestamp': timestamp,
+                    'typeMessage': message_type,
+                    'idMessage': message.get('idMessage', '')
+                }
+                
+                return processed
+            else:
+                # Process messages with alternative structure
+                return self._process_alternative_structure(message, message_type)
         
-        # Check message structure if type detection failed
-        if not message_type:
-            # Dump message structure for debugging (without sensitive content)
-            if self.debug_mode:
-                self.logger.debug(f"Message keys: {list(message.keys())}")
-                if 'messageData' in message:
-                    self.logger.debug(f"messageData keys: {list(message['messageData'].keys())}")
-                    
-                    # Look deeper for potential message types
-                    for key, value in message['messageData'].items():
-                        if isinstance(value, dict):
-                            self.logger.debug(f"{key} keys: {list(value.keys())}")
+        # If no valid message type, check for direct textMessage field
+        if 'textMessage' in message and message.get('textMessage'):
+            text = message.get('textMessage', '')
             
-            # SPECIAL CASE: Check if this might be a different message structure
-            if 'messageData' in message and isinstance(message['messageData'], dict):
-                message_data = message['messageData']
+            # Skip command messages
+            if any(text.startswith(prefix) for prefix in self.command_prefixes):
+                return None
                 
-                # Check for common types in different structure
-                possible_types = ['textMessageData', 'extendedTextMessageData', 'imageMessageData', 
-                                 'videoMessageData', 'documentMessageData', 'audioMessageData']
+            # Format timestamp
+            timestamp = self._format_timestamp(message.get('timestamp', 0))
+            
+            # Create a processed message
+            processed = {
+                'senderName': message.get('senderName', 'Unknown'),
+                'textMessage': text,
+                'timestamp': timestamp,
+                'typeMessage': 'textMessage',
+                'idMessage': message.get('idMessage', '')
+            }
+            
+            return processed
+        
+        # In reduced filtering mode, try to salvage any message with a sender
+        if self.reduced_filtering and 'senderName' in message:
+            # Format timestamp
+            timestamp = self._format_timestamp(message.get('timestamp', 0))
+            
+            # Create a minimal processed message
+            processed = {
+                'senderName': message.get('senderName', 'Unknown'),
+                'textMessage': "[UNKNOWN MESSAGE TYPE]",
+                'timestamp': timestamp,
+                'typeMessage': 'unknown',
+                'idMessage': message.get('idMessage', '')
+            }
+            
+            if self._debug_mode:
+                self.logger.debug(f"Salvaged message with unknown type from {processed['senderName']}")
                 
-                for type_key in possible_types:
-                    if type_key in message_data:
-                        # Convert to standard type name
-                        detected_type = type_key.replace('Data', '')
-                        if self.debug_mode:
-                            self.logger.debug(f"Alternative type detection: {detected_type}")
-                        return self._process_alternative_structure(message, detected_type)
+            return processed
+                
+        # If we got here, we couldn't process the message
+        if self._debug_mode:
+            self.logger.debug(f"Couldn't process message: {message.get('idMessage', 'Unknown ID')}")
         
-        # Skip unsupported message types
-        if not message_type or message_type not in self.supported_message_types:
-            if self.debug_mode:
-                self.logger.debug(f"Skipping message: unsupported type {message_type}")
-            return None
-        
-        # Extract text content
-        text = self._extract_text(message, message_type)
-        
-        # Debug text extraction
-        if not text and self.debug_mode:
-            self.logger.debug(f"No text extracted from {message_type} message")
-        
-        # Skip empty messages unless they are media messages
-        if not text and message_type not in ['imageMessage', 'videoMessage', 'documentMessage', 'audioMessage', 'stickerMessage']:
-            if self.debug_mode:
-                self.logger.debug("Skipping message: empty text")
-            return None
-        
-        # Skip command messages
-        if text and any(text.startswith(prefix) for prefix in self.command_prefixes):
-            if self.debug_mode:
-                self.logger.debug("Skipping message: command message")
-            return None
-        
-        # Format timestamp
-        timestamp = self._format_timestamp(message.get('timestamp', 0))
-        
-        # Create processed message
-        processed = {
-            'senderName': message.get('senderName', 'Unknown'),
-            'textMessage': text or f"[{message_type.upper()}]",  # Always have some text representation
-            'timestamp': timestamp,
-            'type': message_type
-        }
-        
-        return processed
+        return None
     
     def _process_direct_message_format(self, message: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -431,7 +499,7 @@ class MessageProcessor:
         Returns:
             Dict[str, Any]: Processed message
         """
-        if self.debug_mode:
+        if self._debug_mode:
             self.logger.debug(f"Processing direct format message: {message.get('idMessage', 'Unknown ID')}")
         
         # Get message text
@@ -461,7 +529,7 @@ class MessageProcessor:
         
         # Skip command messages
         if text and any(text.startswith(prefix) for prefix in self.command_prefixes):
-            if self.debug_mode:
+            if self._debug_mode:
                 self.logger.debug("Skipping command message")
             return None
         
@@ -470,7 +538,9 @@ class MessageProcessor:
         
         # Create processed message
         processed = {
+            'message_id': message.get('idMessage', f'id_{int(time.time()*1000)}'),
             'senderName': message.get('senderName', 'Unknown'),
+            'sender': message.get('sender', message.get('chatId', 'unknown')),
             'textMessage': text,
             'timestamp': timestamp,
             'type': message.get('type', 'unknown')
@@ -505,7 +575,7 @@ class MessageProcessor:
             text = f"[{media_type.upper()}] {caption}"
         
         if not text:
-            if self.debug_mode:
+            if self._debug_mode:
                 self.logger.debug(f"No text found in alternative structure for {detected_type}")
             return None
             
@@ -514,13 +584,15 @@ class MessageProcessor:
         
         # Create processed message
         processed = {
+            'message_id': message.get('idMessage', f'id_{int(time.time()*1000)}'),
             'senderName': message.get('senderName', 'Unknown'),
+            'sender': message.get('sender', message.get('chatId', 'unknown')),
             'textMessage': text,
             'timestamp': timestamp,
             'type': detected_type
         }
         
-        if self.debug_mode:
+        if self._debug_mode:
             self.logger.debug(f"Processed alternative structure: {detected_type}")
             
         return processed
@@ -536,7 +608,7 @@ class MessageProcessor:
             Optional[str]: Message type or None if not found
         """
         # If debug mode, provide more detailed information
-        if self.debug_mode:
+        if self._debug_mode:
             # Get all potential places where type could be found
             potential_types = []
             
@@ -596,7 +668,7 @@ class MessageProcessor:
             str: Extracted text
         """
         # Log the extraction attempt
-        if self.debug_mode:
+        if self._debug_mode:
             self.logger.debug(f"Extracting text for message type: {message_type}")
             
         try:
@@ -720,7 +792,7 @@ class MessageProcessor:
             if not extracted_text and 'typeMessage' in message:
                 extracted_text += f"[{message.get('typeMessage', 'MESSAGE').upper()}]"
             
-            if self.debug_mode:
+            if self._debug_mode:
                 self.logger.debug(f"Extracted text: {extracted_text[:50]}{'...' if len(extracted_text) > 50 else ''}")
                 
             return extracted_text

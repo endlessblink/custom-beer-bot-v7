@@ -13,6 +13,8 @@ import json
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union
 from supabase import create_client, Client
+import hashlib
+import time
 
 
 class SupabaseClient:
@@ -130,14 +132,30 @@ class SupabaseClient:
             message_text = message.get('message_text', '')
             if not message_text and 'textMessage' in message:
                 message_text = message.get('textMessage', '')
+
+            # בדיקה שיש message_id - אם לא, ניצור מזהה מלאכותי
+            message_id = message.get('message_id', '')
+            if not message_id:
+                # יצירת מזהה ייחודי מבוסס על צירופי השדות הקיימים ותוספת חותמת זמן
+                current_time = str(time.time())
+                group_id = message.get('group_id', '')
+                sender_id = message.get('sender_id', '')
+                content_sample = message_text[:20] if message_text else ''
+                
+                # יצירת מזהה מהשדות הקיימים
+                raw_id = f"{group_id}-{sender_id}-{content_sample}-{current_time}"
+                message_id = f"AUTO_{hashlib.md5(raw_id.encode()).hexdigest()[:12]}"
+                self.logger.info(f"Created automatic message_id: {message_id}")
             
             # אם יש בעיה עם המבנה של הטבלה ועמודת message_text, ננסה לאחסן את ההודעה באמצעות מבנה גמיש יותר
             try:
                 data = {
+                    'message_id': message_id,  # הוספת message_id לנתונים
                     'group_id': message.get('group_id', ''),
+                    'sender': message.get('sender', message.get('sender_id', 'unknown')),  # חייב שדה sender עם ערך לא ריק
                     'sender_id': message.get('sender_id', ''),
                     'sender_name': message.get('senderName', 'Unknown'),
-                    'message_text': message_text,
+                    'message_text': message_text or 'No content',  # דאגה שמשתנה זה לא יהיה ריק
                     'timestamp': timestamp.isoformat(),
                     'message_type': message.get('type', 'text')
                 }

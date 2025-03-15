@@ -289,18 +289,88 @@ def generate_summary(components, group_id, messages=None):
         # If messages are not provided, fetch them from the chat history
         if messages is None:
             logger.info(f"Fetching messages for group {group_id}")
-            messages = green_api_client.get_chat_history(group_id)
+            # Request at least 300 messages, with a minimum of 200
+            # Increasing these values to ensure we have enough messages after processing
+            messages = green_api_client.get_chat_history(group_id, count=300, min_count=200)
         
         if not messages:
             logger.info("No messages to summarize")
             return None
         
-        logger.info(f"Processing {len(messages)} messages")
+        logger.info(f"Processing {len(messages)} messages (raw count)")
+        
+        # Log message types before processing for diagnostics
+        message_types = {}
+        for msg in messages:
+            msg_type = msg.get('typeMessage', 'unknown')
+            message_types[msg_type] = message_types.get(msg_type, 0) + 1
+        logger.info(f"Message types before processing: {message_types}")
+        
+        # Process messages
         processed_messages = message_processor.process_messages(messages)
+        
+        # Log message types after processing for diagnostics
+        processed_types = {}
+        for msg in processed_messages:
+            msg_type = msg.get('typeMessage', 'unknown')
+            processed_types[msg_type] = processed_types.get(msg_type, 0) + 1
+        logger.info(f"Message types after processing: {processed_types} (Total: {len(processed_messages)})")
+        
+        # Check if we have enough processed messages after filtering
+        min_messages_for_summary = 100
+        if len(processed_messages) < min_messages_for_summary:
+            logger.warning(f"Only {len(processed_messages)} messages after processing, which is less than minimum {min_messages_for_summary}. Fetching more.")
+            
+            # Try to fetch more messages in batches, with increasing batch sizes
+            attempts = 0
+            max_attempts = 3
+            
+            while len(processed_messages) < min_messages_for_summary and attempts < max_attempts:
+                attempts += 1
+                logger.info(f"Fetching more messages (attempt {attempts}/{max_attempts})")
+                
+                # Double the count each time, and set a higher minimum
+                new_count = 300 * (2 ** attempts)
+                new_min = min_messages_for_summary * (attempts + 1)
+                
+                try:
+                    # Fetch more messages
+                    logger.info(f"Requesting {new_count} messages with minimum {new_min}")
+                    more_messages = green_api_client.get_chat_history(group_id, count=new_count, min_count=new_min)
+                    
+                    if more_messages:
+                        logger.info(f"Retrieved {len(more_messages)} additional messages")
+                        
+                        # Process the new messages
+                        logger.info(f"Processing additional {len(more_messages)} messages")
+                        more_processed = message_processor.process_messages(more_messages)
+                        logger.info(f"Processed {len(more_processed)} additional messages")
+                        
+                        # Combine with existing messages, avoiding duplicates
+                        existing_ids = {msg.get('idMessage') for msg in processed_messages if 'idMessage' in msg}
+                        new_count = 0
+                        for msg in more_processed:
+                            if msg.get('idMessage') not in existing_ids:
+                                processed_messages.append(msg)
+                                new_count += 1
+                                
+                        logger.info(f"Added {new_count} new unique messages, now have {len(processed_messages)} processed messages")
+                    else:
+                        logger.warning("No additional messages returned")
+                        break
+                except Exception as e:
+                    logger.error(f"Error fetching additional messages: {str(e)}")
+                    break
         
         if not processed_messages:
             logger.info("No valid messages to summarize after processing")
             return None
+        
+        # In case we still don't have enough messages but have some
+        if len(processed_messages) < min_messages_for_summary:
+            logger.warning(f"Final message count ({len(processed_messages)}) is still below the ideal minimum ({min_messages_for_summary}), but proceeding with what we have")
+            
+        logger.info(f"Final count: {len(processed_messages)} messages ready for summarization")
         
         # Store messages in the database
         if supabase_client is not None:
@@ -314,7 +384,22 @@ def generate_summary(components, group_id, messages=None):
         
         # Generate summary
         logger.info("Generating summary...")
+        
+        # Calculate date range for logging
+        if processed_messages:
+            timestamps = [msg.get('timestamp') for msg in processed_messages if 'timestamp' in msg]
+            if timestamps:
+                oldest = datetime.fromtimestamp(min(timestamps))
+                newest = datetime.fromtimestamp(max(timestamps))
+                logger.info(f"Message date range: {oldest.strftime('%Y-%m-%d %H:%M:%S')} to {newest.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        # Generate the summary
         summary = openai_client.generate_summary(processed_messages)
+        logger.info(f"Summary generated successfully ({len(summary)} characters)")
+        
+        # Evaluate summary quality (very basic check)
+        if "לא דווח" in summary and summary.count("לא דווח") > 5:
+            logger.warning("Summary quality check: Many 'not reported' entries detected. This might indicate an issue with summary generation.")
         
         # Store summary in the database
         if supabase_client is not None:

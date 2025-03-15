@@ -195,19 +195,96 @@ def generate_summary(components, group_id, days=1, debug=False):
             display_error_and_continue("Missing required components for summary generation")
             return None
         
-        # Get messages
-        print("\n⏳ Fetching messages...")
-        messages = green_api_client.get_chat_history(group_id)
+        # Set higher request limits to ensure we get enough data
+        message_request_count = 800  # Increased from 500
+        message_min_count = 500  # Increased from 300
         
+        # Get fresh messages directly from WhatsApp - always force fresh data
+        print("\n📱 Fetching fresh messages from WhatsApp...")
+        print(f"⏳ Requesting {message_request_count} messages with minimum {message_min_count}...")
+        messages = green_api_client.get_chat_history(group_id, count=message_request_count, min_count=message_min_count)
+        
+        if not messages:
+            print("\n❌ No messages retrieved from WhatsApp")
+            if debug:
+                print("\nDiagnostic information:")
+                print("- The Green API client was unable to fetch messages")
+                print("- This could be due to connection issues with WhatsApp")
+                print("- You might want to check your Green API credentials")
+                
+                # Offer retry options
+                if confirm_action("Would you like to try again with different parameters?"):
+                    retry_count = int(input("\nHow many messages to request (default: 200): ") or "200")
+                    messages = green_api_client.get_chat_history(group_id, count=retry_count)
+                    if not messages:
+                        print("\n❌ Still no messages retrieved. Falling back to database.")
+                    else:
+                        print(f"\n✅ Retrieved {len(messages)} messages on retry.")
+            
+            # If still no messages, try database
+            if not messages:
+                print("\n📂 Checking database for existing messages...")
+                try:
+                    result = supabase_client.client.table('messages').select('*').eq('group_id', group_id).order('timestamp', desc=True).limit(1000).execute()
+                    db_messages = result.data
+                    if db_messages and len(db_messages) > 0:
+                        print(f"\n✅ Found {len(db_messages)} messages in database")
+                        messages = db_messages
+                    else:
+                        print("\n❌ No messages found in database either")
+                        return None
+                except Exception as e:
+                    print(f"\n❌ Error accessing database: {str(e)}")
+                    return None
+        else:
+            print(f"\n✅ Successfully retrieved {len(messages)} messages from WhatsApp")
+            
+            # Store retrieved messages in database for future use
+            if supabase_client:
+                try:
+                    stored_count = supabase_client.store_messages(messages, group_id)
+                    print(f"\n💾 Stored {stored_count} messages in database")
+                except Exception as e:
+                    print(f"\n⚠️ Could not store messages in database: {str(e)}")
+                    # Continue with summary generation even if storage fails
+        
+        # Debug information
         if debug:
             # Show message count
             print(f"\nFound {len(messages)} raw messages in the group")
+            
+            # Show message types
+            message_types = {}
+            for msg in messages:
+                msg_type = msg.get('typeMessage', 'unknown')
+                message_types[msg_type] = message_types.get(msg_type, 0) + 1
+            print(f"\nMessage types: {message_types}")
             
             # Show a sample message
             if messages:
                 print("\nSample message (first in list):")
                 sample = messages[0]
-                print(f"  Time: {datetime.fromtimestamp(sample.get('timestamp')).strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"  Keys: {list(sample.keys())}")
+                
+                if 'timestamp' in sample:
+                    timestamp = sample.get('timestamp')
+                    print(f"  Timestamp: {timestamp} (type: {type(timestamp).__name__})")
+                    
+                    # Try to convert timestamp if needed
+                    try:
+                        if isinstance(timestamp, str):
+                            if timestamp.isdigit():
+                                timestamp = int(timestamp)
+                            # If it's already a date string, we'll leave it as is
+                        
+                        if isinstance(timestamp, int):
+                            time_str = datetime.fromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+                            print(f"  Time: {time_str}")
+                        else:
+                            print(f"  Time (as string): {timestamp}")
+                    except Exception as e:
+                        print(f"  Error converting timestamp: {str(e)}")
+                        
                 print(f"  From: {sample.get('senderName', 'Unknown')}")
                 print(f"  Type: {sample.get('typeMessage', 'Unknown')}")
                 if 'textMessage' in sample:
@@ -216,22 +293,185 @@ def generate_summary(components, group_id, days=1, debug=False):
             # Calculate and show date range
             if messages:
                 try:
-                    timestamps = [msg.get('timestamp') for msg in messages if 'timestamp' in msg]
+                    # Handle both string and integer timestamps
+                    timestamps = []
+                    for msg in messages:
+                        if 'timestamp' in msg and msg['timestamp'] is not None:
+                            try:
+                                if isinstance(msg['timestamp'], str):
+                                    if msg['timestamp'].isdigit():
+                                        timestamps.append(int(msg['timestamp']))
+                                    else:
+                                        # For date strings, just note that they exist
+                                        print(f"  Found date string timestamp: {msg['timestamp']}")
+                                else:
+                                    timestamps.append(msg['timestamp'])
+                            except (ValueError, TypeError):
+                                pass
+                    
                     if timestamps:
                         oldest = datetime.fromtimestamp(min(timestamps))
                         newest = datetime.fromtimestamp(max(timestamps))
                         print(f"\nMessage date range:")
                         print(f"  Oldest: {oldest.strftime('%Y-%m-%d %H:%M:%S')}")
                         print(f"  Newest: {newest.strftime('%Y-%m-%d %H:%M:%S')}")
+                        
+                        # Check if the newest message is very recent (within the last hour)
+                        now = datetime.now()
+                        if (now - newest).total_seconds() < 3600:  # Less than 1 hour
+                            print("  ✅ Recent messages found - data is up to date")
+                        else:
+                            print(f"  ⚠️ Most recent message is from {(now - newest).total_seconds() / 3600:.1f} hours ago")
+                            if confirm_action("Try to fetch more recent messages?"):
+                                print("\n⏳ Fetching more recent messages...")
+                                more_recent = green_api_client.get_chat_history(group_id, count=100)
+                                if more_recent and len(more_recent) > 0:
+                                    # Check the timestamp of the first message (should be most recent)
+                                    try:
+                                        most_recent_ts = more_recent[0].get('timestamp')
+                                        if most_recent_ts:
+                                            if isinstance(most_recent_ts, str) and most_recent_ts.isdigit():
+                                                most_recent_ts = int(most_recent_ts)
+                                            most_recent_time = datetime.fromtimestamp(most_recent_ts)
+                                            print(f"  Most recent message: {most_recent_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                                            
+                                            # Add these more recent messages to our list
+                                            messages = more_recent + messages
+                                            print(f"  ✅ Added {len(more_recent)} more recent messages")
+                                    except Exception as e:
+                                        print(f"  Error processing recent messages: {str(e)}")
+                                else:
+                                    print("  No more recent messages found")
                 except Exception as e:
                     print(f"Error analyzing message dates: {str(e)}")
         
-        # Process messages
+        # Check if we have any messages at all
+        if not messages:
+            print("\n⚠️ No messages found in the group. Cannot generate summary.")
+            if debug:
+                print("DEBUG: API returned an empty list of messages. Possible causes:")
+                print("1. The group is new or has no message history")
+                print("2. The API credentials don't have access to this group")
+                print("3. There's an issue with the API connection")
+            
+            if confirm_action("Would you like to try again with different parameters?"):
+                print("\n⏳ Retrying with higher message count...")
+                messages = green_api_client.get_chat_history(group_id, count=1500, min_count=1000)  # Even higher counts
+                if not messages:
+                    display_error_and_continue("Still no messages found. Unable to generate summary.")
+                    return None
+                print(f"✅ Retrieved {len(messages)} messages on second attempt!")
+            else:
+                return None
+        
+        # Process messages - enable debug mode to get more visibility
         print("\n⏳ Processing messages...")
+        # If possible, always enable debug mode when a debugging session is active
+        if hasattr(message_processor, 'set_debug_mode') and debug:
+            message_processor.set_debug_mode(True)
+            print("Debug mode enabled for message processor")
+        
+        # Try with reduced filtering first for better results
+        if hasattr(message_processor, 'reduced_filtering'):
+            message_processor.reduced_filtering = True
+            print("Using reduced filtering to include more message content")
+        
         processed_messages = message_processor.process_messages(messages)
         
         if debug:
             print(f"\nProcessed {len(processed_messages)} messages successfully")
+            # Show processed message types
+            processed_types = {}
+            for msg in processed_messages:
+                msg_type = msg.get('typeMessage', 'unknown')
+                processed_types[msg_type] = processed_types.get(msg_type, 0) + 1
+            print(f"\nProcessed message types: {processed_types}")
+            
+            # Verify if messages have timestamps
+            timestamps_present = sum(1 for msg in processed_messages if 'timestamp' in msg and msg['timestamp'] is not None)
+            print(f"Messages with timestamps: {timestamps_present} out of {len(processed_messages)}")
+            
+        # Check if we have enough processed messages after filtering
+        min_messages_for_summary = 200  # Increased from 100
+        
+        # If we have too few processed messages, try again with more lenient processing
+        if len(processed_messages) < min_messages_for_summary:
+            print(f"\n⚠️ Only {len(processed_messages)} messages after processing, which is less than minimum {min_messages_for_summary}.")
+            
+            # Try to improve the situation
+            if hasattr(message_processor, 'reduced_filtering') and not message_processor.reduced_filtering:
+                print("Enabling reduced filtering to include more messages...")
+                message_processor.reduced_filtering = True
+                processed_messages = message_processor.process_messages(messages)
+                print(f"After reduced filtering: {len(processed_messages)} messages")
+            
+            # If still not enough, fetch more
+            if len(processed_messages) < min_messages_for_summary:
+                print("Fetching more messages...")
+                
+                # Try to fetch more messages in batches
+                attempts = 0
+                max_attempts = 3
+                
+                while len(processed_messages) < min_messages_for_summary and attempts < max_attempts:
+                    attempts += 1
+                    print(f"⏳ Fetching more messages (attempt {attempts}/{max_attempts})...")
+                    
+                    # Increase batch size exponentially
+                    new_count = message_request_count * (2 ** attempts)
+                    new_min = min_messages_for_summary * (attempts + 1)
+                    
+                    try:
+                        # Fetch more messages
+                        print(f"⏳ Requesting {new_count} messages with minimum {new_min}...")
+                        more_messages = green_api_client.get_chat_history(group_id, count=new_count, min_count=new_min)
+                        if more_messages:
+                            print(f"✅ Retrieved {len(more_messages)} additional messages")
+                            
+                            # Process the new messages
+                            more_processed = message_processor.process_messages(more_messages)
+                            print(f"✅ Processed {len(more_processed)} additional messages")
+                            
+                            # Combine with existing messages, avoiding duplicates
+                            existing_ids = {msg.get('idMessage') for msg in processed_messages if 'idMessage' in msg}
+                            new_count = 0
+                            for msg in more_processed:
+                                if msg.get('idMessage') not in existing_ids:
+                                    processed_messages.append(msg)
+                                    new_count += 1
+                                    
+                            print(f"✅ Added {new_count} new unique messages, now have {len(processed_messages)} processed messages")
+                        else:
+                            print("⚠️ No additional messages returned")
+                            break
+                    except Exception as e:
+                        print(f"❌ Error fetching additional messages: {str(e)}")
+                        break
+        
+        if len(processed_messages) < min_messages_for_summary:
+            print(f"\n⚠️ Could only obtain {len(processed_messages)} messages for summarization, which is less than the ideal minimum of {min_messages_for_summary}")
+            
+            # If we have very few messages, they might be special messages that need careful handling
+            if len(processed_messages) < 10:
+                print("\n⚠️ Very few messages available. This might indicate a new group or access restrictions.")
+                
+                if debug:
+                    print("\nRemaining messages after processing:")
+                    for i, msg in enumerate(processed_messages[:5]):  # Show up to 5 messages
+                        msg_type = msg.get('typeMessage', 'unknown')
+                        sender = msg.get('senderName', 'Unknown')
+                        text = msg.get('textMessage', '[No text]')
+                        print(f"{i+1}. [{msg_type}] {sender}: {text[:50]}...")
+            
+            # Ask if the user wants to continue with the limited number of messages
+            if not confirm_action("Continue with the limited number of messages?"):
+                return None
+        else:
+            print(f"\n✅ Successfully processed {len(processed_messages)} messages for summarization")
+            
+        if len(processed_messages) == 0:
+            display_error_and_continue("No valid messages after processing")
+            return None
         
         # Store messages in the database if available
         if supabase_client:
@@ -244,8 +484,83 @@ def generate_summary(components, group_id, days=1, debug=False):
                     print(f"\n⚠️ Database error: {str(e)}")
         
         # Generate the summary
-        print("\n⏳ Generating summary with OpenAI...")
-        summary = openai_client.generate_summary(processed_messages)
+        print(f"\n⏳ Generating summary with OpenAI from {len(processed_messages)} messages...")
+        
+        # Add a cache-busting timestamp to ensure we get a fresh summary
+        cache_buster = datetime.now().strftime('%Y%m%d%H%M%S')
+        
+        # Option for custom prompt
+        use_custom_prompt = debug and confirm_action("Would you like to use a custom prompt for the summary?")
+        
+        if use_custom_prompt:
+            print("\nEnter your custom prompt instructions below (end with a blank line):")
+            custom_instructions = []
+            while True:
+                line = input()
+                if not line:
+                    break
+                custom_instructions.append(line)
+            
+            custom_prompt = "\n".join(custom_instructions)
+            print(f"\n⏳ Generating summary with custom prompt ({len(custom_prompt)} chars)...")
+            
+            try:
+                # Add cache buster to the custom prompt
+                custom_prompt += f"\n\nTimestamp: {cache_buster}"
+                summary = openai_client.generate_summary(processed_messages, target_language='hebrew')
+                print(f"\n✅ Summary generated with custom prompt")
+            except Exception as e:
+                print(f"\n❌ Error generating summary with custom prompt: {str(e)}")
+                if confirm_action("Try with default prompt instead?"):
+                    print("\n⏳ Generating summary with default prompt...")
+                    summary = openai_client.generate_summary(processed_messages, target_language='hebrew')
+                else:
+                    display_error_and_continue(f"Failed to generate summary: {str(e)}")
+                    return None
+        else:
+            try:
+                # Always force a new summary by using cache busting timestamp
+                print("\n⏳ Generating fresh summary... הסיכום יהיה עדכני למועד הנוכחי")
+                # Use the timestamp parameter for cache busting
+                summary = openai_client.generate_summary(processed_messages, target_language='hebrew')
+                print(f"\n✅ Summary generated successfully")
+                
+                # Check summary quality by looking for too many "not reported" entries
+                if "לא דווח" in summary and summary.count("לא דווח") > 10:
+                    print("\n⚠️ התגלו יותר מדי רשומות 'לא דווח' בסיכום. זה עשוי להצביע על בעיה.")
+                    if debug and confirm_action("האם לנסות ליצור סיכום חדש עם פחות סינון?"):
+                        print("\n⏳ מנסה ליצור סיכום חדש עם פחות סינון...")
+                        # Enable less filtering in the message processor if possible
+                        if hasattr(message_processor, 'set_debug_mode'):
+                            message_processor.set_debug_mode(True)
+                            reprocessed_messages = message_processor.process_messages(messages)
+                            if len(reprocessed_messages) > len(processed_messages):
+                                print(f"\n✅ עיבוד מחדש מצא {len(reprocessed_messages)} הודעות (לעומת {len(processed_messages)} קודם)")
+                                summary = openai_client.generate_summary(reprocessed_messages, target_language='hebrew')
+                                print(f"\n✅ סיכום חדש נוצר בהצלחה")
+                            else:
+                                print("\n⚠️ עיבוד מחדש לא הניב יותר הודעות")
+                
+            except Exception as e:
+                error_msg = str(e)
+                print(f"\n❌ Error generating summary: {error_msg}")
+                
+                if "maximum context length" in error_msg.lower():
+                    print("\nThe input might be too large for the model. Trying with fewer messages...")
+                    # Try with half the messages
+                    half_count = len(processed_messages) // 2
+                    try:
+                        reduced_messages = processed_messages[:half_count]
+                        print(f"\n⏳ Retrying with {half_count} messages...")
+                        summary = openai_client.generate_summary(reduced_messages, target_language='hebrew')
+                        print(f"\n✅ Summary generated successfully with reduced message count")
+                    except Exception as e2:
+                        print(f"\n❌ Second attempt also failed: {str(e2)}")
+                        display_error_and_continue(f"Failed to generate summary even with reduced messages: {str(e2)}")
+                        return None
+                else:
+                    display_error_and_continue(f"Failed to generate summary: {error_msg}")
+                    return None
         
         # Store the summary in the database if available
         if supabase_client:
@@ -272,6 +587,10 @@ def generate_summary(components, group_id, days=1, debug=False):
     except Exception as e:
         logger.error(f"Error generating summary: {str(e)}")
         display_error_and_continue(f"Error generating summary: {str(e)}")
+        if debug:
+            import traceback
+            traceback.print_exc()
+            print("\nTraceback printed for debugging")
         return None
 
 def send_summary(components, group_id, summary):

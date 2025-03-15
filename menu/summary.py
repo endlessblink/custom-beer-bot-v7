@@ -263,10 +263,12 @@ def generate_summary(components, group_id=None, days=None, use_api=True):
         # Get group ID if not provided
         if not group_id:
             from menu.groups import select_group
-            group_id = select_group(components)
-            if not group_id:
+            group = select_group(components)
+            if not group or not isinstance(group, dict) or 'id' not in group:
                 logger.error("No group selected for summary generation")
                 return None
+            group_id = group['id']
+            logger.info(f"Selected group: {group.get('name', group_id)}")
                 
         # Get number of days if not provided
         if days is None:
@@ -279,22 +281,26 @@ def generate_summary(components, group_id=None, days=None, use_api=True):
         messages = []
         
         if use_api:
-            # Try to get messages from the API
+            # Always try to get fresh messages from the API first
             logger.info(f"Generating summary for the last {days} days using fresh WhatsApp messages...")
             
             group_manager = components['group_manager']
             green_api = components['green_api_client']
             
             try:
-                logger.info(f"Fetching messages from API for group {group_id}")
+                logger.info(f"Fetching latest messages from API for group {group_id}")
                 
-                # Check which method is available for fetching chat history
-                if hasattr(group_manager, 'get_chat_history') and callable(getattr(group_manager, 'get_chat_history')):
-                    api_messages = group_manager.get_chat_history(group_id, days)
-                elif hasattr(green_api, 'get_chat_history') and callable(getattr(green_api, 'get_chat_history')):
-                    api_messages = green_api.get_chat_history(group_id, days)
-                elif hasattr(group_manager, 'fetch_messages') and callable(getattr(group_manager, 'fetch_messages')):
-                    api_messages = group_manager.fetch_messages(group_id, days)
+                # Always try to get at least 100 latest messages regardless of days
+                print("\n📥 Fetching the latest messages from WhatsApp...")
+                
+                # Check which method is available and fetch at least 100 messages
+                if hasattr(green_api, 'get_chat_history') and callable(getattr(green_api, 'get_chat_history')):
+                    # Fetch 100 messages with minimum count set to 100
+                    api_messages = green_api.get_chat_history(group_id, count=200, min_count=100)
+                    logger.info(f"Used green_api.get_chat_history to fetch messages")
+                elif hasattr(group_manager, 'get_chat_history') and callable(getattr(group_manager, 'get_chat_history')):
+                    api_messages = group_manager.get_chat_history(group_id, count=200)
+                    logger.info(f"Used group_manager.get_chat_history to fetch messages")
                 else:
                     logger.error("No suitable method found to fetch chat history from API")
                     api_messages = []
@@ -302,15 +308,29 @@ def generate_summary(components, group_id=None, days=None, use_api=True):
                 if api_messages and len(api_messages) > 0:
                     messages = api_messages
                     logger.info(f"Retrieved {len(messages)} messages from API")
+                    print(f"✅ Retrieved {len(messages)} messages from WhatsApp")
+                    
+                    # Store messages in database for future use
+                    try:
+                        stored_count = supabase_client.store_messages(api_messages, group_id)
+                        logger.info(f"Stored {stored_count} messages in database")
+                        print(f"💾 Stored {stored_count} messages in database")
+                    except Exception as e:
+                        logger.warning(f"Could not store messages in database: {str(e)}")
+                        # Continue with summary generation even if storage fails
                 else:
                     logger.warning("No messages retrieved from API, falling back to database")
+                    print("\n⚠️ Could not retrieve messages from WhatsApp, trying database...")
             except Exception as e:
                 logger.error(f"Error fetching messages from API: {str(e)}", exc_info=True)
+                print(f"\n❌ Error fetching messages from WhatsApp: {str(e)}")
+                print("Falling back to database...")
                 
         # If we don't have messages from API or not using API, try database
         if not messages:
             try:
                 logger.info(f"Fetching messages from database for group {group_id}")
+                print("\n📂 Searching for messages in database...")
                 
                 # Query database for messages from the group
                 try:
@@ -327,6 +347,7 @@ def generate_summary(components, group_id=None, days=None, use_api=True):
                         db_messages = result.data
                 
                 logger.info(f"Found {len(db_messages)} messages in database")
+                print(f"✅ Found {len(db_messages)} messages in database")
                 
                 # Convert to list of dicts if not already
                 if db_messages and isinstance(db_messages, list):
@@ -341,35 +362,47 @@ def generate_summary(components, group_id=None, days=None, use_api=True):
                 
             except Exception as e:
                 logger.error(f"Error fetching messages from database: {str(e)}", exc_info=True)
-        
-        # Filter messages by date
-        if messages:
-            messages = filter_messages_by_date(messages, days)
+                print(f"\n❌ Error fetching messages from database: {str(e)}")
+                
+        # Filter messages by date if days parameter is provided
+        if messages and days:
+            filtered_messages = filter_messages_by_date(messages, days)
+            logger.info(f"Filtered from {len(messages)} to {len(filtered_messages)} messages based on {days} days filter")
+            print(f"\n🔍 Filtered to {len(filtered_messages)} messages from the last {days} days")
+            messages = filtered_messages
         
         # Check if we have messages to process
         if not messages or len(messages) == 0:
-            logger.warning(f"No messages found in the last {days} days")
+            logger.warning(f"No messages found in the selected period")
+            print("\n❌ No messages found in the selected period")
             return None
             
         # Process messages and generate summary
         logger.info(f"Processing {len(messages)} messages for summary")
+        print(f"\n⚙️ Processing {len(messages)} messages...")
         processed_content = message_processor.process_messages(messages)
         
         if not processed_content:
             logger.error("Failed to process messages for summary")
+            print("\n❌ Failed to process messages")
             return None
+            
+        print(f"✅ Successfully processed {len(processed_content)} messages")
             
         # Generate summary
         logger.info("Generating summary from processed content")
+        print("\n🤖 Generating summary...")
         summary = openai_client.generate_summary(processed_content)
         
         if not summary or summary.strip() == "":
             logger.error("Invalid summary generated")
+            print("\n❌ Failed to generate summary")
             return None
             
         # Log the successful summary generation with the first part of its content
         summary_preview = summary[:50] + "..." if len(summary) > 50 else summary
         logger.info(f"Summary generated successfully ({len(summary)} chars): {summary_preview}")
+        print(f"\n✅ Summary generated successfully ({len(summary)} characters)")
         
         # Save summary to file as a backup
         try:
