@@ -125,6 +125,9 @@ class OpenAIClient:
             if len(summary) < 100:
                 logging.warning(f"Generated summary is very short ({len(summary)} chars), which might indicate a problem")
             
+            # Remove empty sections from the summary
+            summary = self._remove_empty_sections(summary)
+            
             return summary
             
         except Exception as e:
@@ -654,6 +657,9 @@ SUMMARY:
                 self.logger.error(error_msg)
                 raise ValueError(error_msg)
             
+            # Remove empty sections from the summary
+            summary = self._remove_empty_sections(summary)
+            
             self.logger.info("Summary generated successfully")
             return summary
             
@@ -668,7 +674,7 @@ SUMMARY:
             msg_texts = [f"{msg.get('senderName', 'Unknown')}: {msg.get('textMessage', '')}" 
                         for msg in messages if 'textMessage' in msg]
             return f"### סיכום בסיסי (בעקבות שגיאת API)\n\n" + "\n".join(msg_texts)
-
+            
         except openai.RateLimitError as e:
             error_msg = f"OpenAI rate limit exceeded: {str(e)}"
             self.logger.error(error_msg)
@@ -707,4 +713,83 @@ SUMMARY:
             self.logger.info("Creating basic fallback summary due to unexpected error")
             msg_texts = [f"{msg.get('senderName', 'Unknown')}: {msg.get('textMessage', '')}" 
                         for msg in messages if 'textMessage' in msg]
-            return f"### סיכום בסיסי\n\n" + "\n".join(msg_texts) 
+            return f"### סיכום בסיסי\n\n" + "\n".join(msg_texts)
+    
+    def _remove_empty_sections(self, summary: str) -> str:
+        """
+        Remove empty sections from the summary
+        
+        This function looks for sections that only contain a headline followed by:
+        - No content
+        - Empty bullet points
+        - Statements indicating there's nothing to report like "No [items] found" or "None"
+        
+        Args:
+            summary (str): The generated summary
+            
+        Returns:
+            str: The summary with empty sections removed
+        """
+        self.logger.info("Removing empty sections from summary")
+        
+        # Split the summary into lines
+        lines = summary.split('\n')
+        
+        # Process the lines
+        result_lines = []
+        section_start_index = -1
+        current_section_has_content = False
+        
+        for i, line in enumerate(lines):
+            # Check if this line is a section header (starts with ### or ####)
+            is_section_header = line.strip().startswith('###')
+            
+            # If we found a new section header
+            if is_section_header:
+                # If we were processing a previous section
+                if section_start_index >= 0:
+                    # If the previous section had content, add it to result
+                    if current_section_has_content:
+                        result_lines.extend(lines[section_start_index:i])
+                    # Otherwise, log that we're skipping an empty section
+                    else:
+                        skipped_header = lines[section_start_index].strip()
+                        self.logger.info(f"Skipping empty section: {skipped_header}")
+                
+                # Start tracking the new section
+                section_start_index = i
+                current_section_has_content = False
+            
+            # Check if the current line contains actual content
+            elif line.strip() and not line.strip().startswith('-'):
+                current_section_has_content = True
+            
+            # Check if the line is a bullet point with content
+            elif line.strip().startswith('-'):
+                # Check if the bullet point has content beyond standard "none" indicators
+                bullet_content = line.strip()[1:].strip()
+                empty_indicators = [
+                    "none", "no items", "no updates", "not available", "לא זמין", 
+                    "אין", "לא נמצאו", "לא קיימים", "אין מידע", "not found", 
+                    "אין עדכונים", "לא הוצגו", "לא דווחו", "לא התקבלו"
+                ]
+                
+                if bullet_content and not any(indicator in bullet_content.lower() for indicator in empty_indicators):
+                    current_section_has_content = True
+        
+        # Don't forget to process the last section
+        if section_start_index >= 0:
+            if current_section_has_content:
+                result_lines.extend(lines[section_start_index:])
+            else:
+                skipped_header = lines[section_start_index].strip()
+                self.logger.info(f"Skipping empty section: {skipped_header}")
+        
+        # Join the result lines back into a string
+        processed_summary = '\n'.join(result_lines)
+        
+        # Add an info log about how many lines were removed
+        removed_lines = len(lines) - len(result_lines)
+        self.logger.info(f"Removed {removed_lines} lines from summary (empty sections)")
+        
+        return processed_summary 

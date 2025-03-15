@@ -214,13 +214,47 @@ class SupabaseClient:
         if not messages:
             return 0
         
-        stored_count = 0
+        # Get all message IDs for checking duplicates
+        message_ids = []
         for message in messages:
             message['group_id'] = group_id
-            if self.store_message(message):
-                stored_count += 1
+            # Create message_id if not present
+            if not message.get('message_id'):
+                message_text = message.get('message_text', '')
+                if not message_text and 'textMessage' in message:
+                    message_text = message.get('textMessage', '')
+                
+                current_time = str(time.time())
+                sender_id = message.get('sender_id', '')
+                content_sample = message_text[:20] if message_text else ''
+                
+                raw_id = f"{group_id}-{sender_id}-{content_sample}-{current_time}"
+                message_id = f"AUTO_{hashlib.md5(raw_id.encode()).hexdigest()[:12]}"
+                message['message_id'] = message_id
+            
+            message_ids.append(message.get('message_id'))
         
-        self.logger.info(f"Stored {stored_count} messages for group {group_id}")
+        # Check which messages already exist in database
+        existing_ids = set()
+        try:
+            # Check in batches to avoid too large queries
+            for i in range(0, len(message_ids), 100):
+                batch = message_ids[i:i+100]
+                if batch:
+                    result = self.client.table('messages').select('message_id').in_('message_id', batch).execute()
+                    for row in result.data:
+                        existing_ids.add(row.get('message_id'))
+        except Exception as e:
+            self.logger.warning(f"Error checking for existing messages: {str(e)}")
+        
+        # Store only new messages
+        stored_count = 0
+        for message in messages:
+            if message.get('message_id') not in existing_ids:
+                if self.store_message(message):
+                    stored_count += 1
+        
+        self.logger.info(f"Stored {stored_count} new messages out of {len(messages)} total for group {group_id}")
         return stored_count
     
     def store_summary(self, summary: str, group_id: str, 

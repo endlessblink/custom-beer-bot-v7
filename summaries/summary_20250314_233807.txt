@@ -1,0 +1,42 @@
+## סיכום שיחות קבוצת Custom Beer Node
+### תאריך: 2025-03-14 | תקופה: 13-14 במרץ 2025
+
+### 😂 בדיחת AI היום:
+"אם המחשב שלך מתנהג כמו חיית מחמד, תוודא שהוא לא שוכב על כבל HDMI!"
+
+### 1. פרויקטים ופיתוחים שהוצגו
+- **Sesame** - Oded Becker - קוד פתוח המיועד לפיתוח כלים בתחום הבינה המלאכותית.
+
+### 2. תוצרים ודמואים שהוצגו
+- לא דווח על תוצרים ספציפיים.
+
+### 3. כלים וטכנולוגיות חדשים שנדונו
+- **ComfyUI** - ליאור - כלי להסרת רקעים בגרסה אחרונה 2.0. [קישור](https://github.com/1038lab/ComfyUI-RMBG)
+- **Hedra** - Itay - אתר חדש בתחום. [קישור](https://www.hedra.com/)
+
+### 4. בעיות טכניות ופתרונות שהוצעו
+- **בעיית זליגת מתח** - V.K.Riez Visual Solutions הציע להכניס את ה-GPU לסטרס עם טסט סינטטי כדי לבדוק את הבעיה.
+- **כיבוי מסך במהלך גינרוט** - Beep Beep דיווח על הבעיה, ו-SoundGuy הציע לבדוק את חיבורי ה-HDMI.
+
+### 5. משאבים ומאמרים שהועברו
+- **מאמר על AI** - [קישור](https://huggingface.co/papers/2503.07598) - שיתף: Asaf.
+- **דמו של Relight** - [קישור](https://huggingface.co/spaces/jasperai/LBM_relighting) - שיתף: אברהם יצחק מאיר.
+- **Flying Effect Model** - [קישור](https://civitai.com/models/1348626/flying-effect-wan21-i2v-lora?modelVersionId=1523247) - שיתף: derechlev.
+
+### 6. סטטוס פרויקטים מתמשכים
+- לא דווח על סטטוס פרויקטים מתמשכים.
+
+### 7. שאלות פתוחות ותחומי עניין לעתיד
+- **כמה משאבים צריך כדי לאמן לורה?** - הועלה על ידי: Maya.
+
+### 8. חידושים בתחום בינה מלאכותית גנרטיבית
+- לא דווח על חידושים בתחום.
+
+### 9. ווקפלואים (workflows) של ComfyUI שהועברו
+- לא דווח על ווקפלואים ספציפיים שהועברו.
+
+### 10. מושגים טכניים חדשים שנדונו
+- לא דווח על מושגים טכניים חדשים.
+
+### קישורים רלוונטיים
+- Sesame GitHub: [קישור](https://github.com/SesameAILabs/csm)
